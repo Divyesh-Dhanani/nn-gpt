@@ -6,6 +6,8 @@ the regen_*/run_step* experiment scripts -- is seen across the whole package.
 """
 from __future__ import annotations
 
+import os
+
 from ab.nn.util.Const import out_dir
 
 
@@ -98,8 +100,27 @@ USE_THIRD_EARLY_EPOCH = False
 # (R^2=0.820/0.056) as a single-variable change: everything else identical.
 USE_CHAIN_OF_THOUGHT = False
 
-MODEL_NAME = "unsloth/Qwen3-8B-unsloth-bnb-4bit"
-MODEL_FALLBACKS = ("unsloth/Qwen3-8B-bnb-4bit", "Qwen/Qwen3-8B")
+# Model registry: publicly available Unsloth 4-bit checkpoints usable by this exact
+# QLoRA pipeline. Qwen stays the DEFAULT (nothing removed). Switch the active model
+# with the ACC_MODEL env var (e.g. ACC_MODEL=llama3.1-8b) -- no code edit needed --
+# or change the ACTIVE_MODEL default below. The run folder is named from MODEL_NAME,
+# so each model's results land in their own <model>_seed<seed>/ directory.
+MODEL_PRESETS = {
+    "qwen3-8b": (
+        "unsloth/Qwen3-8B-unsloth-bnb-4bit",
+        ("unsloth/Qwen3-8B-bnb-4bit", "Qwen/Qwen3-8B"),
+    ),
+    "llama3.1-8b": (
+        "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit",
+        ("unsloth/Meta-Llama-3.1-8B-Instruct",),
+    ),
+    "gemma2-9b": (
+        "unsloth/gemma-2-9b-it-bnb-4bit",
+        ("unsloth/gemma-2-9b-it",),
+    ),
+}
+ACTIVE_MODEL = os.environ.get("ACC_MODEL", "qwen3-8b")
+MODEL_NAME, MODEL_FALLBACKS = MODEL_PRESETS[ACTIVE_MODEL]
 DEFAULT_MAX_SEQ_LEN = 6144
 
 PREDICTOR_HF_REPO = "ABrain/Accuracy-Prediction"

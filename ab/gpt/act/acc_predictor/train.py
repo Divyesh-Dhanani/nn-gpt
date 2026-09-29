@@ -38,6 +38,7 @@ def train_model(
     warmup_ratio: float = WARMUP_RATIO,
     batch_size: int = BATCH_SIZE,
     gradient_accumulation_steps: int = GRADIENT_ACCUMULATION_STEPS,
+    seed: int = SEED,
 ) -> None:
     train_examples = _load_messages(train_path)
     val_examples = _load_messages(val_path)
@@ -59,7 +60,7 @@ def train_model(
         lora_dropout=LORA_DROPOUT,
         bias="none",
         use_gradient_checkpointing="unsloth",
-        random_state=SEED,
+        random_state=seed,
         use_rslora=False,
         loftq_config=None,
     )
@@ -105,7 +106,7 @@ def train_model(
         "optim": "adamw_8bit",
         "weight_decay": WEIGHT_DECAY,
         "lr_scheduler_type": "linear",
-        "seed": SEED,
+        "seed": seed,
         "output_dir": str(output_dir),
         "report_to": "none",
         "save_strategy": "epoch",
