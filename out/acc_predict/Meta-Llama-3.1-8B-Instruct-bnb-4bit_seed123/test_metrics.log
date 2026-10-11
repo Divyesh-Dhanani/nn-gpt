@@ -1,0 +1,25 @@
+test_run /home/divyeshdhanani/Desktop/Pipline/nn-gpt/out/acc_predict/Meta-Llama-3.1-8B-Instruct-bnb-4bit_seed123/test_predictions.csv
+total_samples 657
+valid_predictions 657
+parse_failures 0
+best_accuracy_RMSE 0.1592
+best_accuracy_MAE 0.0843
+best_accuracy_Pearson_r 0.8791
+best_accuracy_Spearman_r 0.8824
+best_accuracy_R2 0.7342
+best_epoch_RMSE 17.2626
+best_epoch_MAE 10.4932
+best_epoch_Pearson_r 0.3804
+best_epoch_Spearman_r 0.0965
+best_epoch_R2 -0.5204
+
+per_dataset_best_accuracy (dataset n pearson_r spearman_r r2 rmse mae [low_n]):
+  celeba-gender 55 0.8886 0.8343 0.7232 0.0782 0.0347
+  cifar-10 73 0.7878 0.8047 0.6098 0.1348 0.1075
+  cifar-100 53 0.6873 0.7031 0.1687 0.1412 0.1074
+  coco 133 0.9092 0.9031 0.5888 0.0511 0.0314
+  imagenette 44 0.4761 0.4587 -0.3683 0.1474 0.1118
+  mnist 71 0.0722 0.3146 -0.3859 0.1710 0.0565
+  places365 15 0.7661 0.6937 -0.3879 0.0942 0.0773
+  svhn 70 0.6670 0.6540 0.0693 0.2994 0.1717
+  wikitext 143 0.6872 0.8424 0.0072 0.1703 0.0955

@@ -1,0 +1,25 @@
+test_run /home/divyeshdhanani/Desktop/Pipline/nn-gpt/out/acc_predict/Qwen3-8B-unsloth-bnb-4bit_seed42/test_predictions.csv
+total_samples 657
+valid_predictions 657
+parse_failures 0
+best_accuracy_RMSE 0.1547
+best_accuracy_MAE 0.0776
+best_accuracy_Pearson_r 0.8808
+best_accuracy_Spearman_r 0.8900
+best_accuracy_R2 0.7491
+best_epoch_RMSE 17.0790
+best_epoch_MAE 10.0852
+best_epoch_Pearson_r 0.3959
+best_epoch_Spearman_r 0.1562
+best_epoch_R2 -0.4882
+
+per_dataset_best_accuracy (dataset n pearson_r spearman_r r2 rmse mae [low_n]):
+  celeba-gender 55 0.8816 0.8029 0.7129 0.0796 0.0353
+  cifar-10 73 0.7980 0.8140 0.5723 0.1411 0.1099
+  cifar-100 53 0.7121 0.7273 0.3731 0.1226 0.1025
+  coco 133 0.9485 0.9249 0.8758 0.0281 0.0215
+  imagenette 44 0.3974 0.5145 -0.4160 0.1499 0.1139
+  mnist 71 0.1652 0.6876 -0.2480 0.1622 0.0548
+  places365 15 0.8420 0.7630 0.3644 0.0638 0.0587
+  svhn 70 0.6067 0.6663 0.0030 0.3099 0.1737
+  wikitext 143 0.7349 0.8762 0.1916 0.1536 0.0755
