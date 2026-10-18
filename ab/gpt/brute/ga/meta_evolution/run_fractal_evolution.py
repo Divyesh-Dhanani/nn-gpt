@@ -45,6 +45,7 @@ import torch
 from ab.gpt.brute.ga.meta_evolution.FractalNet_evolvable_backbone import SEARCH_SPACE, generate_model_code_string
 from ab.gpt.util.eval.Eval import Eval
 from ab.gpt.util.eval.acc_client import predict_best_accuracy
+from ab.gpt.util.method.llmatic import ga_bridge
 import ab.nn.api as nn_dataset
 import pandas as pd
 # MONKEYPATCH: Bypass the massive remote database download inside Eval.py
@@ -591,6 +592,8 @@ if __name__ == "__main__":
             mutation_rate=0.2,
             checkpoint_path=CHECKPOINT
         )
+        llmatic_ga = ga_bridge.from_env(PIPELINE_DIR, DATASET)  # opt-in via LLMATIC_GA; None when unset
+        if llmatic_ga: llmatic_ga.patch_initial_population(ga)
         
         # No checkpoint — start from generation 0
         start_gen = 0
@@ -620,11 +623,13 @@ if __name__ == "__main__":
             generation_seen.add(model_checksum)
 
             fitness = fitness_function(chromosome)
+            if llmatic_ga: llmatic_ga.add({k: chromosome[k] for k in SEARCH_SPACE}, code_str, fitness)
             # Update archive after evaluation
             update_archive({'chromosome': chromosome, 'fitness': fitness}, SEARCH_SPACE)
             return fitness
 
         best, history = ga.run(target_gens, fitness_with_archive)
+        if llmatic_ga: llmatic_ga.save()
         
         # Save Best Architecture
         if best:

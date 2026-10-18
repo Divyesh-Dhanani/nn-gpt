@@ -51,7 +51,6 @@ LR_SCHEDULER = "cosine"
 MAX_GRAD_NORM = 1.0
 PER_DEVICE_TRAIN_BATCH_SIZE = 2   # KTO requires actual batch size > 1 for valid KL estimation
 GRADIENT_ACCUMULATION_STEPS = 4
-WARMUP_RATIO = 0.05
 LOGGING_STEPS = 10
 LEARNING_RATE = 1e-5
 WEIGHT_DECAY = 0.01
@@ -257,7 +256,6 @@ def run_kto(
     learning_rate: float = LEARNING_RATE,
     weight_decay: float = WEIGHT_DECAY,
     warmup_steps: Optional[int] = WARMUP_STEPS,
-    warmup_ratio: float = WARMUP_RATIO,
     max_grad_norm: float = MAX_GRAD_NORM,
     per_device_train_batch_size: int = PER_DEVICE_TRAIN_BATCH_SIZE,
     per_device_eval_batch_size: Optional[int] = 1,
@@ -318,7 +316,7 @@ def run_kto(
     if warmup_steps is not None:
         training_kwargs["warmup_steps"] = warmup_steps
     else:
-        training_kwargs["warmup_ratio"] = warmup_ratio
+        training_kwargs["warmup_steps"] = warmup_steps
     if per_device_eval_batch_size is not None:
         training_kwargs["per_device_eval_batch_size"] = per_device_eval_batch_size
     if evaluation_strategy is not None:
@@ -447,7 +445,7 @@ def main():
     parser.add_argument("-l", "--learning_rate", type=float, default=LEARNING_RATE)
     parser.add_argument("--weight_decay", type=float, default=WEIGHT_DECAY)
     parser.add_argument("--warmup_steps", type=int, default=WARMUP_STEPS)
-    parser.add_argument("--warmup_ratio", type=float, default=WARMUP_RATIO)
+    parser.add_argument("--warmup_steps", type=float, default=WARMUP_STEPS)
     parser.add_argument("-g", "--max_grad_norm", type=float, default=MAX_GRAD_NORM)
     parser.add_argument("-ls", "--lr_scheduler", dest="lr_scheduler_type", type=str, default=LR_SCHEDULER)
     parser.add_argument("--per_device_train_batch_size", type=int, default=PER_DEVICE_TRAIN_BATCH_SIZE)
@@ -556,7 +554,6 @@ def main():
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         warmup_steps=args.warmup_steps,
-        warmup_ratio=args.warmup_ratio,
         max_grad_norm=args.max_grad_norm,
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,

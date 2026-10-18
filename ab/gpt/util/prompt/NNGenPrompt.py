@@ -255,6 +255,14 @@ class NNGenPrompt(Prompt):
         response, category, text] row. This is the exact production tail,
         lifted verbatim so wide-mode output is unchanged."""
 
+        # Hyperparameters arrive from LEMUR as Python dicts. str.format() would
+        # render them with repr(), i.e. single quotes, and the pipeline parses
+        # what comes back out of <hp> as JSON -- so the model was being trained
+        # on a format its own extractor rejects ("Expecting value: line 1
+        # column 1"). Serialise them as JSON so the target matches the parser.
+        para = {k: (json.dumps(v, default=str) if isinstance(v, dict) else v)
+                for k, v in para.items()}
+
         # ========== APPLY FORMULA EVALUATION TO PROMPT ==========
         inst = prompt_template.format(**para)
         inst = evaluate_delimited_formulas(inst, para)

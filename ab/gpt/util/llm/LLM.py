@@ -146,7 +146,7 @@ class LLM:
             trust_remote_code=True,
             max_memory={i: max_memory for i in range(torch.cuda.device_count())},
             token=access_token,
-            torch_dtype=torch.bfloat16,  # QLoRA compute
+            dtype=torch.bfloat16,  # QLoRA compute
             gguf_file=gguf_file,
             config=config,
             **deepspeed_specific_prm

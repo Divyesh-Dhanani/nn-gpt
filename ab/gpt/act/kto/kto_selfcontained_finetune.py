@@ -488,7 +488,7 @@ class SelfContainedKTOPipeline:
         # Import here so generation/training subprocess dispatch doesn't pay the
         # heavy ab.nn import cost, and so a missing optional dep fails loudly only
         # at eval time.
-        from ab.gpt import NNEval
+        import ab.gpt.act.eval.Eval as NNEval
 
         eval_by_id: Dict[str, Dict[str, Any]] = {}
         try:

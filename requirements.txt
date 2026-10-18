@@ -8,21 +8,24 @@ nn-dup>=2.2.4
 bitsandbytes>=0.45.0
 peft>=0.14.0
 gguf>=0.10.0
-trl
+trl==1.14.2
 sentence-transformers>=3.3.1
 faiss-cpu
 overrides>=7.7.0
 datasketch # to check code novelty
 langgraph>=1.0.4
 
-unsloth==2026.3.4
-unsloth-zoo==2026.3.2
+unsloth==2026.10.6
+unsloth-zoo==2026.10.6
+torchao>=0.13.0,<0.16  # torchao 0.16+ targets torch 2.10+; nn-dataset pins torch 2.9.1
 triton>=3.4.0
+# vllm-0.16 for the torch==2.9.1
+https://github.com/vllm-project/vllm/releases/download/v0.16.0/vllm-0.16.0%2Bcu130-cp38-abi3-manylinux_2_35_x86_64.whl
 
 matplotlib
 optimum[onnxruntime-gpu]
 onnx>=1.16.0
 onnxruntime-gpu>=1.18.0
-kernels
+kernels>=0.10.2,<0.11  # same range transformers 5.2.0 declares; >=0.15 breaks its import
 
 httpx

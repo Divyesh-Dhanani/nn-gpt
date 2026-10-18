@@ -58,6 +58,69 @@ TRANSFORM_OUT_DIR = trans_dir / 'dataset_epoch1'
 TRANSFORM_RES_DIR = trans_dir / 'result_epoch1'
 
 
+def _env_on(name) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _carry_probe(model, tokenizer, max_len, out_dir):
+    """Mean token loss of the model as built for this cycle on fixed chat rows
+    (NNGPT_CARRY_PROBE=comma-separated jsonl paths; NNGPT_CARRY_PROBE_N rows each).
+    Measurement only: prints one line per file and writes carry_probe.json."""
+    import hashlib
+    paths = [p for p in os.environ.get("NNGPT_CARRY_PROBE", "").split(",") if p.strip()]
+    n_rows = int(os.environ.get("NNGPT_CARRY_PROBE_N", "64"))
+    results = {}
+    was_training = model.training
+    model.eval()
+    device = next(model.parameters()).device
+    for path in paths:
+        rows = []
+        with open(path.strip(), encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    rows.append(json.loads(line))
+                if len(rows) >= n_rows:
+                    break
+        per_row = []
+        for row in rows:
+            messages = row.get("messages", [])
+            text = tokenizer.apply_chat_template(messages, tokenize=False)
+            # Same tokenization as SFT (Prompt.preprocess_batch).
+            ids = tokenizer(text, truncation=True, max_length=max_len)["input_ids"]
+            prompt = tokenizer.apply_chat_template(
+                [m for m in messages if m["role"] != "assistant"], tokenize=False, add_generation_prompt=True)
+            n_prompt = len(tokenizer(prompt, truncation=True, max_length=max_len)["input_ids"])
+            x = torch.tensor([ids], device=device)
+            with torch.no_grad():
+                logits = model(input_ids=x).logits[0, :-1].float()
+            tok_loss = torch.nn.functional.cross_entropy(logits, x[0, 1:], reduction="none")
+            code = tok_loss[max(n_prompt - 1, 0):]
+            per_row.append({
+                "ids_sha1": hashlib.sha1(json.dumps(ids).encode()).hexdigest(),
+                "n_tokens": len(ids) - 1,
+                "loss_sum_all": float(tok_loss.sum()),
+                "n_code": int(code.numel()),
+                "loss_sum_code": float(code.sum()),
+            })
+        n_all = sum(r["n_tokens"] for r in per_row) or 1
+        n_code = sum(r["n_code"] for r in per_row) or 1
+        summary = {
+            "n": len(per_row),
+            "loss_all": sum(r["loss_sum_all"] for r in per_row) / n_all,
+            "loss_code": sum(r["loss_sum_code"] for r in per_row) / n_code,
+            "rows": per_row,
+        }
+        results[path.strip()] = summary
+        print(f"[carry-probe] file={path.strip()} n={summary['n']} "
+              f"loss_all={summary['loss_all']:.6f} loss_code={summary['loss_code']:.6f}", flush=True)
+    if was_training:
+        model.train()
+    if out_dir is not None:
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        (Path(out_dir) / "carry_probe.json").write_text(json.dumps(results, indent=1))
+    return results
+
+
 # Delta mode constants
 _MAX_DELTA_RETRIES = 2
 
@@ -94,6 +157,143 @@ def flatten_chunks(data):
 # ============================================================
 # SINGLE SOURCE OF TRUTH: GENERATION (nn_gen / trans_gen)
 # ============================================================
+
+# How many seed rows to draw per requested model. A prompt that does not leave
+# MIN room for the answer is skipped, and a skipped prompt used to cost the epoch
+# one model: test_nn rows in, fewer than test_nn models out, and an empty
+# full_output.txt where the generation should have been. Drawing a surplus turns
+# that into a refill -- oversized prompts are dropped and the next candidate
+# takes the slot, until test_nn prompts have been accepted.
+SEED_POOL_FACTOR = float(os.environ.get("NNGPT_SEED_POOL_FACTOR", "3") or 3)
+SEED_POOL_MIN_SURPLUS = 8
+
+
+# Smallest answer worth asking for. A complete reply is three blocks -- <hp>,
+# <tr> and a full <nn> class -- which does not fit in a few hundred tokens. When
+# the window left after the prompt is below this, the model is being asked for
+# something it cannot deliver and the output comes back cut off mid-class, which
+# is what filled the last cycles with unparseable generations. Such a prompt is
+# dropped and the seed pool refills the slot instead.
+MIN_ANSWER_TOKENS = int(os.environ.get("NNGPT_MIN_ANSWER_TOKENS", "1280") or 1280)
+
+
+def warn_if_truncated(full_out, max_new_tokens, idx, tokenizer=None):
+    """Report a generation that ran out of budget instead of finishing.
+
+    This was called in the delta path but never defined or imported anywhere, so
+    every delta generation raised NameError the moment it reached this line. It
+    is defined here and used on both generation paths, because a truncated reply
+    is the single most common way a cycle loses a model: the code block is cut
+    mid-class, extraction finds no closing tag, and the model is counted as a
+    failure with no indication of why.
+
+    Returns True when the output looks truncated.
+    """
+    if not isinstance(full_out, str) or not full_out.strip():
+        return False
+
+    reasons = []
+    if tokenizer is not None and max_new_tokens:
+        try:
+            produced = len(tokenizer(full_out, add_special_tokens=False)["input_ids"])
+            if produced >= max_new_tokens - 2:
+                reasons.append(f"hit the {max_new_tokens}-token generation budget")
+        except Exception:
+            pass
+    for tag in ("nn", "tr", "hp"):
+        if f"<{tag}>" in full_out and f"</{tag}>" not in full_out:
+            reasons.append(f"<{tag}> was opened and never closed")
+    if full_out.count("```") % 2:
+        reasons.append("an unterminated code fence")
+
+    if reasons:
+        print(f"[TRUNCATED] B{idx}: {'; '.join(reasons)}. The reply is cut off, so "
+              f"extraction will find less than was asked for. Lower the prompt size "
+              f"or raise max_seq_length so the answer has room.", flush=True)
+        return True
+    return False
+
+
+def _seed_pool_size(test_nn):
+    """Number of seed rows to draw so test_nn prompts survive the length filter."""
+    if not test_nn or test_nn < 1:
+        return test_nn
+    return max(int(test_nn * SEED_POOL_FACTOR), test_nn + SEED_POOL_MIN_SURPLUS)
+
+
+def _prompt_token_length(chat_bot, prompt_text):
+    """Rendered prompt length in tokens, or None when it cannot be measured."""
+    try:
+        if hasattr(chat_bot, "token_length"):          # vLLM sleep-mode engine
+            return chat_bot.token_length(prompt_text)
+        rendered = chat_bot._templated_from_messages(
+            chat_bot._build_messages(prompt_text))
+        return len(chat_bot.tokenizer(
+            rendered, add_special_tokens=False)["input_ids"])
+    except Exception:
+        return None
+
+
+def _prompt_budget(chat_bot, in_len, max_new_tokens, unsloth_max_input_length):
+    """New-token budget left after an in_len-token prompt, or None to drop it.
+
+    A budget below MIN_ANSWER_TOKENS counts as no budget at all. The underlying
+    floor is 256 tokens, which is enough to start a reply but nowhere near
+    enough to finish one, so prompts that squeezed past it were answered with a
+    truncated block that extraction then rejected -- the epoch paid full
+    generation cost for a model it could never evaluate.
+    """
+    if in_len is None:
+        return max_new_tokens
+    if unsloth_max_input_length and in_len > unsloth_max_input_length:
+        return None
+    try:
+        if hasattr(chat_bot, "output_budget"):         # vLLM sleep-mode engine
+            budget = chat_bot.output_budget(in_len, max_new_tokens)
+        else:
+            from ab.gpt.util.llm.Chatbot import _context_limit, _output_budget
+            ctx = _context_limit(chat_bot.model, chat_bot.tokenizer)
+            budget = _output_budget(ctx, in_len, max_new_tokens)
+    except Exception:
+        return max_new_tokens
+    if budget is not None and budget < MIN_ANSWER_TOKENS:
+        return None
+    return budget
+
+
+def _select_fitting_prompts(prompts, chat_bot, test_nn, max_new_tokens,
+                            unsloth_max_input_length):
+    """Take prompts in order until test_nn of them fit the context window.
+
+    Returns ``(accepted, dropped)``. Dropping happens here, before anything is
+    sent and before a model directory is created, so an oversized prompt leaves
+    no empty full_output.txt behind and does not consume one of the test_nn
+    slots -- the next candidate does.
+    """
+    accepted, dropped = [], 0
+    wanted = test_nn if (test_nn and test_nn > 0) else len(prompts)
+    for prompt_data in prompts:
+        if len(accepted) >= wanted:
+            break
+        in_len = _prompt_token_length(chat_bot, prompt_data[1])
+        if _prompt_budget(chat_bot, in_len, max_new_tokens,
+                          unsloth_max_input_length) is None:
+            dropped += 1
+            print(f"[gen] Prompt dropped before sending: input_tokens={in_len} "
+                  f"leaves under {MIN_ANSWER_TOKENS} tokens for the answer; "
+                  f"refilling from the seed pool.", flush=True)
+            continue
+        accepted.append(prompt_data)
+    if dropped:
+        print(f"[gen] {dropped} oversized prompt(s) skipped; "
+              f"{len(accepted)}/{wanted} prompts accepted for generation.",
+              flush=True)
+    if len(accepted) < wanted:
+        print(f"[WARNING] Only {len(accepted)} of {wanted} prompts fit the context "
+              f"window; the seed pool is exhausted. Raise NNGPT_SEED_POOL_FACTOR "
+              f"or lower max_new_tokens / nn_code_max_chars.", flush=True)
+    return accepted, dropped
+
 
 def nn_gen(
     epoch,
@@ -148,6 +348,7 @@ def nn_gen(
                 task=key_config["task"],
                 dataset=gen_dataset,
                 nn_prefixes=gen_nn_prefixes,
+                epoch=key_config.get("epoch"),
                 sql=JoinConf(
                     num_joint_nns=num_joint_nns,
                     same_columns=tuple(key_config.get("keep_same", [])),
@@ -168,6 +369,9 @@ def nn_gen(
                 # Pin generation seeds to the configured corpus (default cifar-10 / ga-)
                 data_kwargs["dataset"] = gen_dataset
                 data_kwargs["nn_prefixes"] = gen_nn_prefixes
+            gen_epoch = key_config.get("epoch")
+            if gen_epoch is not None:
+                data_kwargs["epoch"] = gen_epoch
             data = lemur.data(**data_kwargs)
             if data.empty or "nn" not in data.columns:
                 raise ValueError(
@@ -188,7 +392,9 @@ def nn_gen(
             if llmatic_seeds is not None:
                 data = llmatic_seeds
             else:
-                data = data.groupby(by="nn").sample(n=1)[:test_nn]
+                from ab.gpt.util.eval.Seed import pin_generation_seeds
+                data = pin_generation_seeds(
+                    data, _seed_pool_size(test_nn), out_path, epoch=epoch)
             if use_backbone:
                 datasets = sorted(data["dataset"].dropna().unique().tolist()) if "dataset" in data else []
                 print(
@@ -246,6 +452,11 @@ def nn_gen(
                 )
             prompts.append((system_text, prompt_text, row, output_type))
 
+    # Length filter runs once, over the whole over-provisioned pool, so the
+    # epoch still produces test_nn models when some prompts are too long.
+    prompts, _ = _select_fitting_prompts(
+        prompts, chat_bot, test_nn, max_new_tokens, unsloth_max_input_length)
+
     models_dir = synth_dir(out_path)
 
     if use_delta:
@@ -261,15 +472,8 @@ def nn_gen(
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
 
-            if unsloth_max_input_length:
-                in_text = chat_bot._build_messages(prompt_text)
-                token_len = len(chat_bot.tokenizer.apply_chat_template(
-                    in_text, add_generation_prompt=True))
-                print(
-                    f'Sample prompt length: {token_len}, max_input_length: {unsloth_max_input_length}')
-                if token_len > unsloth_max_input_length:
-                    print(f'Prompt is too long, skipping...')
-                    continue
+            # Length filtering already happened over the whole seed pool in
+            # _select_fitting_prompts(); everything that reaches here fits.
 
             baseline_code = origdf.get(
                 'nn_code', '') if origdf is not None else ''
@@ -395,6 +599,8 @@ def nn_gen(
                 print(f'[ERROR] No code generated for model B{idx}')
                 continue
 
+            warn_if_truncated(full_out, max_new_tokens, idx,
+                              getattr(chat_bot, "tokenizer", None))
             create_file(model_dir, new_out_file, full_out)
             df_file = model_dir / 'dataframe.df'
             if origdf is None:
@@ -412,22 +618,25 @@ def nn_gen(
             system_text, prompt_text, origdf, output_type = prompt_data
             chat_bot.system_prompt = system_text or None
 
-            if unsloth_max_input_length:
-                in_text = chat_bot._build_messages(prompt_text)
-                output = chat_bot.tokenizer.apply_chat_template(
-                    in_text, add_generation_prompt=True)
-                print(
-                    f'Sample prompt length: {len(output)}, max_input_length: {unsloth_max_input_length}')
-                if len(output) > unsloth_max_input_length:
-                    print(f'Prompt is too long, skipping...')
-                    continue
+            # Everything in `prompts` has already passed the context-window
+            # filter, so nothing is dropped here and `pending` always holds the
+            # full test_nn set.
 
             pending.append(
                 (idx, system_text, prompt_text, origdf, output_type))
 
         if prompt_batch < 1:
             prompt_batch = 1
-        if prompt_batch > 1:
+        # vLLM schedules its own continuous batch and pages the KV cache, so it
+        # wants every prompt at once rather than pairs. That is also what makes
+        # 4-bit inference affordable: each dequantized weight tile is reused
+        # across all sequences in flight instead of being rebuilt per pair, so
+        # the dequantization cost is amortised instead of paid ~8 times over.
+        if hasattr(chat_bot, "llm") and pending:
+            prompt_batch = len(pending)
+            print(f'[INFO] vLLM continuous batching: submitting all '
+                  f'{prompt_batch} prompts together')
+        elif prompt_batch > 1:
             print(
                 f'[INFO] Batch generation enabled: prompt_batch={prompt_batch}')
 
@@ -459,6 +668,12 @@ def nn_gen(
                     continue
                 if save_llm_output:
                     create_file(model_dir, new_out_file, full_out)
+
+                # A cut-off reply is the commonest way a cycle loses a model:
+                # extraction finds no closing tag and reports "no code" without
+                # saying the budget ran out. Say so.
+                warn_if_truncated(full_out, max_new_tokens, idx,
+                                  getattr(chat_bot, "tokenizer", None))
 
                 try:
                     print(f'Generated params: {hp}')
@@ -499,40 +714,11 @@ def nn_gen(
                         model_dir, f"original_{origdf['nn']}.py", origdf['nn_code'])
                     origdf.to_pickle(df_file)
 
-    # Track generation-side progress even before later merge logic or external
-    # tooling reads cycle_results.json.
-    tracker_file = nngpt_dir / "epoch_tracker.json"
-    if tracker_file.exists():
-        try:
-            with open(tracker_file) as f:
-                tracker_data = json.load(f)
-        except Exception:
-            tracker_data = []
-    else:
-        tracker_data = []
-
-    accuracy = None
-    cycle_file = nngpt_dir / "cycle_results.json"
-    if cycle_file.exists():
-        try:
-            with open(cycle_file) as f:
-                cycle_data = json.load(f)
-            accuracy = cycle_data.get("evaluation", {}).get("best_accuracy")
-        except Exception:
-            pass
-
-    tracker_data.append(
-        {
-            "epoch": epoch,
-            "timestamp": datetime.now().isoformat(),
-            "models_generated": len(list(models_dir.glob("B*"))) if exists(models_dir) else 0,
-            "accuracy": accuracy,
-        }
-    )
-    tracker_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(tracker_file, "w") as f:
-        json.dump(tracker_data, f, indent=2)
-    print(f"[EPOCH TRACKER] Wrote epoch {epoch} (acc={accuracy})")
+    # NOTE: epoch statistics used to be written here. nn_gen() runs BEFORE the
+    # models are evaluated, so the accuracy it read out of cycle_results.json
+    # was always the PREVIOUS epoch's -- every row was one epoch late. The
+    # record is now produced at the end of _evaluate_epoch(), from this epoch's
+    # own artifacts. See ab/gpt/util/data/EpochStats.py.
 
     print('[DEBUG] Release memory.')
     release_memory()
@@ -661,37 +847,50 @@ def generate_step(state: AgentState) -> dict:
 
     print(f"[INFO] Generation at epoch {epoch}")
 
-    if state.get("trans_mode", False):
-        trans_gen(
-            epoch,
-            out_path,
-            state["chat_bot"],
-            state["conf_keys"],
-            state["nn_train_epochs"],
-            state["prompt_dict"],
-            state["test_nn"],
-            state["max_new_tokens"],
-            state["save_llm_output"],
-            state.get("nn_name_prefix"),
+    vllm_engine = state.get("vllm_engine")
+    if vllm_engine is not None:
+        vllm_engine.fallback = state.get("chat_bot_hf")
+        vllm_engine.prepare(
+            epoch_dir(epoch - 1) / state["base_model_name"] if epoch > 0 else None,
+            state.get("model"),
         )
-    else:
-        nn_gen(
-            epoch,
-            out_path,
-            state["chat_bot"],
-            state["conf_keys"],
-            state["nn_train_epochs"],
-            state["prompt_dict"],
-            state["test_nn"],
-            state["max_new_tokens"],
-            state["save_llm_output"],
-            state.get("nn_name_prefix"),
-            state.get("unsloth_max_input_length"),
-            state.get("prompt_batch", 1),
-            use_backbone=state.get("use_backbone",False),
-            sft_nn_prefixes=state.get("sft_nn_prefixes"),
-            sft_dataset=state.get("sft_dataset"),
-        )
+
+    try:
+        if state.get("trans_mode", False):
+            trans_gen(
+                epoch,
+                out_path,
+                state["chat_bot"],
+                state["conf_keys"],
+                state["nn_train_epochs"],
+                state["prompt_dict"],
+                state["test_nn"],
+                state["max_new_tokens"],
+                state["save_llm_output"],
+                state.get("nn_name_prefix"),
+            )
+        else:
+            nn_gen(
+                epoch,
+                out_path,
+                state["chat_bot"],
+                state["conf_keys"],
+                state["nn_train_epochs"],
+                state["prompt_dict"],
+                state["test_nn"],
+                state["max_new_tokens"],
+                state["save_llm_output"],
+                state.get("nn_name_prefix"),
+                state.get("unsloth_max_input_length"),
+                state.get("prompt_batch", 1),
+                use_backbone=state.get("use_backbone",False),
+                sft_nn_prefixes=state.get("sft_nn_prefixes"),
+                sft_dataset=state.get("sft_dataset"),
+            )
+
+    finally:
+        if vllm_engine is not None:
+            vllm_engine.release(state.get("model"))
 
     # Classification prompts may intentionally emit labels or structured output
     # without generating a runnable new_nn.py file.
@@ -701,6 +900,17 @@ def generate_step(state: AgentState) -> dict:
     if not has_output:
         print(
             f"[INFO] No code generated at epoch {epoch}, skipping evaluation")
+        # Still record the epoch. Skipping evaluation used to skip the report
+        # as well, so a collapsed epoch vanished from epoch_tracker.json
+        # entirely instead of being visible as 0 valid out of N attempts --
+        # exactly the epochs worth seeing.
+        try:
+            from ab.gpt.util.data.EpochStats import update_epoch_report
+            update_epoch_report(synth_dir(out_path), epoch, nngpt_dir)
+        except Exception as exc:
+            print(f"[EPOCH STATS] Could not record skipped epoch {epoch}: {exc}")
+        if state.get("final_eval"):
+            return {"next_action": "end", "final_eval_done": True}
         return {"next_action": "finetune"}
 
     return {"next_action": "evaluate"}
@@ -864,6 +1074,16 @@ def _evaluate_epoch(
             except Exception:
                 continue
 
+    # Epoch statistics: valid-generation rate with a Wilson interval, accuracy
+    # of the generated models (mean with 95% CI, and max) and the accuracy the
+    # seed models had before modification. Written after evaluation so the row
+    # describes THIS epoch, then the plot is refreshed. Never raises.
+    if exists(models_dir):
+        from ab.gpt.util.data.EpochStats import update_epoch_report
+        epoch_stats = update_epoch_report(models_dir, epoch, nngpt_dir)
+        if epoch_stats:
+            results["epoch_stats"] = epoch_stats
+
     return results
 
 
@@ -913,7 +1133,12 @@ def evaluate_step(state: AgentState) -> dict:
     has_epoch2 = has_epoch2_in_state or "epoch_2_accuracy" in updates
     has_epoch3 = has_epoch3_in_state or "epoch_3_accuracy" in updates
 
-    if use_predictor and has_epoch1 and has_epoch2 and has_epoch3:
+    if state.get("final_eval"):
+        # Closing pass: the adapter has now been validated and the epoch
+        # finalised, so the run stops here instead of fine-tuning again.
+        updates["next_action"] = "end"
+        updates["final_eval_done"] = True
+    elif use_predictor and has_epoch1 and has_epoch2 and has_epoch3:
         updates["next_action"] = "predict"
     else:
         updates["next_action"] = "finetune"
@@ -934,6 +1159,7 @@ def _finetune_epoch(
     data_dir=None,
     budget_tokens=None,
     suppress_thinking=False,
+    reset_previous_results=True,
 ):
     """
     Single source of truth for one finetune epoch.
@@ -1002,6 +1228,9 @@ def finetune_step(state: AgentState) -> dict:
     print(f"[DEBUG] Perform finetune at epoch {epoch}")
 
     _prev_bot = state.get("chat_bot")
+    vllm_engine = state.get("vllm_engine")
+    if vllm_engine is not None:
+        vllm_engine.ensure_asleep()
     model, chat_bot = _finetune_epoch(
         epoch, out_path,
         state["model"], state["tokenizer"], state["model_loader"], state["lora_tuner"],
@@ -1020,9 +1249,13 @@ def finetune_step(state: AgentState) -> dict:
         suppress_thinking=getattr(_prev_bot, "suppress_thinking", False),
     )
 
+    if vllm_engine is not None:
+        vllm_engine.fallback = chat_bot
+
     return {
         "model": model,
-        "chat_bot": chat_bot,
+        "chat_bot": vllm_engine if vllm_engine is not None else chat_bot,
+        "chat_bot_hf": chat_bot,
         "current_epoch": epoch + 1,
         "next_action": "generate",
         "trainer_resume_checkpoint": None,
@@ -1102,6 +1335,9 @@ def tune(
     budget_tokens=None,
     skip_lm_finetune=False,
     suppress_thinking=False,
+    dataset=None,
+    nn_prefixes=None,
+    reset_previous_results=True
 ):
     if not isinstance(conf_keys, (list, tuple)):
         conf_keys = (conf_keys,)
@@ -1162,6 +1398,15 @@ def tune(
             if isinstance(prompt_dict.get(_key), dict):
                 prompt_dict[_key]["llmatic"] = dict(llmatic)
 
+    # Seed generation from the given corpus unless the prompt key sets its own;
+    # nn_gen reads key_config["dataset"] / ["nn_prefixes"].
+    for _key in conf_keys:
+        if isinstance(prompt_dict.get(_key), dict):
+            if dataset:
+                prompt_dict[_key].setdefault("dataset", dataset)
+            if nn_prefixes:
+                prompt_dict[_key].setdefault("nn_prefixes", list(nn_prefixes))
+
     from ab.gpt.util.llm.LLM import LLM
 
     model_loader = LLM(
@@ -1181,10 +1426,19 @@ def tune(
     trainer_resume_checkpoint = _resolve_tune_resume_trainer_checkpoint(
         llm_path)
 
+    init_adapter = None
     if llm_path:
         print(f'Load saved LoRA layer from path: {llm_path}')
-        model = PeftModel.from_pretrained(model, llm_path, is_trainable=True)
-        model = model.merge_and_unload()
+        if _env_on("NNGPT_CARRY_ADAPTER"):
+            # Merging into the 4-bit base re-quantizes the weights and erases the
+            # adapter's update. Keep the base frozen; LoRA() reloads this
+            # adapter as trainable and continues training it.
+            if not Path(llm_path, "adapter_config.json").exists():
+                raise FileNotFoundError(f"NNGPT_CARRY_ADAPTER: no adapter_config.json in {llm_path}")
+            init_adapter = llm_path
+        else:
+            model = PeftModel.from_pretrained(model, llm_path, is_trainable=True)
+            model = model.merge_and_unload()
 
     if use_deepspeed:
         deepspeed.initialize(model=model, config_params=ds_conf)
@@ -1196,13 +1450,33 @@ def tune(
         access_token=access_token,
         peft_config=peft_config,
         use_unsloth=use_unsloth,
+        init_adapter=init_adapter,
     )
 
     print('Using Max Length:', model_loader.get_max_length())
 
+    if os.environ.get("NNGPT_CARRY_PROBE"):
+        # Loss of the model exactly as this cycle will generate with it.
+        _probe_len = (unsloth_max_input_length if (use_unsloth and unsloth_max_input_length)
+                      else context_length if context_length else model_loader.get_max_length())
+        _carry_probe(model, tokenizer, _probe_len, epoch_root_path.parent)
+
     chat_bot = ChatBot(
         model, tokenizer, temperature=temperature, top_k=top_k, top_p=top_p,
         budget_tokens=budget_tokens, suppress_thinking=suppress_thinking)
+
+    # vLLM sleep-mode generation backend (NNGPT_VLLM_SLEEP=1 / --use_vllm).
+    from ab.gpt.util.llm.VLLMSleep import sleep_mode_enabled, VLLMGeneration
+    _gen_len = (unsloth_max_input_length if (use_unsloth and unsloth_max_input_length)
+                else context_length if context_length else model_loader.get_max_length())
+    vllm_engine = VLLMGeneration(
+        base_model_name, tokenizer, _gen_len,
+        temperature=temperature, top_k=top_k, top_p=top_p,
+    ) if sleep_mode_enabled() else None
+    _hf_chat_bot = chat_bot
+    if vllm_engine is not None:
+        vllm_engine.fallback = _hf_chat_bot
+        chat_bot = vllm_engine
 
     state = AgentState(
         experiment_id=nn_name_prefix or "exp_default",
@@ -1218,6 +1492,8 @@ def tune(
         model_loader=model_loader,
         lora_tuner=lora_tuner,
         chat_bot=chat_bot,
+        vllm_engine=vllm_engine,
+        chat_bot_hf=_hf_chat_bot,
 
         prompt_dict=prompt_dict,
         conf_keys=conf_keys,
@@ -1249,6 +1525,10 @@ def tune(
         classification_mode=classification_mode,
     )
 
+    # Statistics files from a previous run are cleared by the caller
+    # (ab/gpt/act/tune/Tune.py) before this function is entered; see
+    # EpochStats.reset_run_artifacts. Doing it there keeps every tune()
+    # backend -- Tune, Tune_Onnx, Tune_prun -- on the same signature.
     shutil.rmtree(epoch_root_path, ignore_errors=True)
 
     if use_agents:
@@ -1261,11 +1541,18 @@ def tune(
         if epoch < skip_epoch:
             print(f'Skipped generation at epoch {epoch}')
         else:
+            if vllm_engine is not None:
+                vllm_engine.prepare(
+                    run_epoch_dir(epoch - 1) / base_model_name if epoch > 0 else None,
+                    model)
             if trans_mode:
                 trans_gen(epoch, out_path, chat_bot, conf_keys, nn_train_epochs,
                           prompt_dict, test_nn, max_new_tokens, save_llm_output, nn_name_prefix)
             else:
                 nn_gen(epoch, out_path, chat_bot, conf_keys, nn_train_epochs, prompt_dict, test_nn, max_new_tokens, save_llm_output, nn_name_prefix, unsloth_max_input_length, prompt_batch, use_backbone=use_backbone, sft_nn_prefixes=sft_nn_prefixes, sft_dataset=sft_dataset)
+
+            if vllm_engine is not None:
+                vllm_engine.release(model)
 
             _evaluate_epoch(
                 epoch,
@@ -1281,6 +1568,8 @@ def tune(
             print(f'[INFO] skip_lm_finetune=True — skipping LLM LoRA update at epoch {epoch}.')
         else:
             print(f'[DEBUG]Perform finetune at epoch {epoch}.')
+            if vllm_engine is not None:
+                vllm_engine.ensure_asleep()
             model, chat_bot = _finetune_epoch(
                 epoch, out_path, model, tokenizer, model_loader, lora_tuner,
                 context_length, use_unsloth, unsloth_max_input_length,
@@ -1296,3 +1585,40 @@ def tune(
                 suppress_thinking=suppress_thinking,
             )
             trainer_resume_checkpoint = None
+            if vllm_engine is not None:
+                vllm_engine.fallback = chat_bot
+                chat_bot = vllm_engine
+
+    # Closing validation pass for the classic loop, mirroring the agent path:
+    # the loop fine-tunes after evaluating, so without this the final adapter
+    # is never generated from, never validated and never recorded.
+    if not skip_lm_finetune and llm_tune_epochs > 0:
+        final_epoch = llm_tune_epochs
+        print(f'[INFO] Closing validation pass for the final adapter (epoch {final_epoch})')
+        out_path = run_epoch_dir(final_epoch)
+        if vllm_engine is not None:
+            vllm_engine.prepare(
+                run_epoch_dir(final_epoch - 1) / base_model_name, model)
+        if trans_mode:
+            trans_gen(final_epoch, out_path, chat_bot, conf_keys, nn_train_epochs,
+                      prompt_dict, test_nn, max_new_tokens, save_llm_output, nn_name_prefix)
+        else:
+            nn_gen(final_epoch, out_path, chat_bot, conf_keys, nn_train_epochs, prompt_dict,
+                   test_nn, max_new_tokens, save_llm_output, nn_name_prefix,
+                   unsloth_max_input_length, prompt_batch, use_backbone=use_backbone,
+                   sft_nn_prefixes=sft_nn_prefixes, sft_dataset=sft_dataset)
+        if vllm_engine is not None:
+            vllm_engine.release(model)
+
+        _evaluate_epoch(
+            final_epoch,
+            out_path,
+            nn_name_prefix,
+            nn_train_epochs,
+            trans_mode,
+            classification_mode,
+            custom_synth_dir=synth_dir(out_path),
+        )
+
+    if vllm_engine is not None:
+        vllm_engine.shutdown()
