@@ -10,7 +10,7 @@ def main():
         nn_gen_conf_id='optimal_channel_configuration_test',
         test_nn=16,
         skip_epoches=-1,          # generate at epoch 0 => pre-fine-tuning baseline
-        nn_name_prefix='ast-dimension',
+        nn_name_prefix='llm',
         context_length=8 * 1024,
         sft_max_length=4 * 1024,  # packing block size; keep <= context_length
         max_new_tokens=8 * 1024,

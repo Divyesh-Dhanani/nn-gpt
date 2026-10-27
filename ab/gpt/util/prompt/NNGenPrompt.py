@@ -1,3 +1,5 @@
+import os
+import random
 import json
 import time
 from pathlib import Path
@@ -96,8 +98,22 @@ class NNGenPrompt(Prompt):
                 line = line.strip()
                 if line:
                     rows.append(json.loads(line))
-        if n_training_prompts:
-            rows = rows[:n_training_prompts]
+        if n_training_prompts and len(rows) > n_training_prompts:
+            # Sample, do not truncate. rows[:n] fed the trainer the same first
+            # n rows every cycle: with a corpus larger than max_prompts the
+            # remainder was never seen at all, and the rows that were seen were
+            # seen over and over, which is how the training loss reaches ~0.02
+            # and the model starts reproducing its own corpus. The seed is the
+            # cycle number, so each cycle draws a different subset and the run
+            # is still reproducible.
+            try:
+                sample_seed = int(os.environ.get("NNGPT_SFT_SAMPLE_SEED", "0") or 0)
+            except ValueError:
+                sample_seed = 0
+            available = len(rows)
+            rows = random.Random(sample_seed).sample(rows, n_training_prompts)
+            print(f"[SFT] sampled {n_training_prompts} of {available} corpus rows "
+                  f"(cycle seed {sample_seed})", flush=True)
         frame = _empty_frame()
         for row in rows:
             messages = row.get("messages", [])
@@ -343,12 +359,9 @@ class NNGenPrompt(Prompt):
         output_template = '\n'.join(output_block) if output_block else None
         print(f'Preparing Data for key: {key}...', flush=True)
 
-        # ========== SMALL SWITCH TO DETECT PRUNING CONFIG ==========
-        # Check if this is a pruning task (key starts with 'pruning' or contains 'pruning')
-        is_pruning = (
-            key.lower().startswith('pruning') or
-            'pruning' in key.lower()
-        )
+        # A pruning prompt, by key name. 'prun' and not 'pruning': the shipped
+        # config (NN_gen_prun.json) is keyed 'prun_prompt'.
+        is_pruning = 'prun' in key.lower()
 
         # Check if this is a workstation runtime-data prompt.
         is_runtime = (

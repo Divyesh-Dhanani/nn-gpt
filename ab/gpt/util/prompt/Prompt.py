@@ -4,6 +4,8 @@ from datasets import Dataset
 from pandas import DataFrame
 from transformers import PreTrainedTokenizerBase
 
+from ab.gpt.util.llm.LLMUtil import prepare_text_tokenizer, unwrap_tokenizer
+
 # Fallback chat template for tokenizers that ship without one (e.g.
 # ABrain/NNGPT-UniqueArch-Rag). Without it, apply_chat_template raises
 # "tokenizer.chat_template is not set".
@@ -31,16 +33,25 @@ DEFAULT_CHAT_TEMPLATE = (
 def preprocess_batch(batch, tokenizer, max_length):
     """
     Tokenizing a batch
+
+    `text=` is not cosmetic. A multimodal processor's __call__ signature is
+    (images, text, videos, audio), so a positional first argument is read as
+    IMAGES and the run dies in decode_image with "Unsupported image file".
+    The unwrap below normally removes the processor long before this point;
+    the keyword keeps this function correct even when it does not, and is
+    accepted unchanged by every plain tokenizer (`text` is its first parameter
+    too).
     """
+    tokenizer = unwrap_tokenizer(tokenizer)
     result = tokenizer(
-        batch['text'],
+        text=batch['text'],
         truncation=True,
         max_length=max_length,
     )
     # Also tokenize response to check its length
     if 'response' in batch:
         response_tokenized = tokenizer(
-            batch['response'],
+            text=batch['response'],
             truncation=False
         )
         # Add response_length field for filtering
@@ -49,9 +60,13 @@ def preprocess_batch(batch, tokenizer, max_length):
 
 
 class Prompt:
-    def __init__(self, max_len: int, tokenizer: PreTrainedTokenizerBase, system_prompt: str = None):
+    def __init__(self, max_len: int, tokenizer, system_prompt: str = None):
+        # `tokenizer` may be a processor (Qwen3VLProcessor) when the caller
+        # built it from a VL checkpoint without going through LLM.__init__.
+        # Unwrapping here keeps the training-data build and generation on the
+        # same tokenizer and the same chat template.
         self.max_len = max_len
-        self.tokenizer = tokenizer
+        self.tokenizer = prepare_text_tokenizer(tokenizer, log_prefix="[Prompt]")
         self.system_prompt = system_prompt
 
     def _build_messages(self, user_content: str, assistant_content: str = None, system_prompt: str = None) -> list:

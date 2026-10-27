@@ -23,6 +23,7 @@ from this epoch's own directory removes the lag entirely.
 import json
 import math
 import os
+import random
 from datetime import datetime
 from pathlib import Path
 
@@ -136,6 +137,75 @@ def _label(name, dataset):
     return f"{name} ({dataset})" if dataset else str(name)
 
 
+#: Accuracy of the best design point in the LEMUR corpus the run started from.
+#: The objective is the best model a cycle produces, so the number that matters
+#: is how often a cycle clears this, not how far the mean moved.
+def _corpus_ceiling():
+    raw = os.environ.get("NNGPT_DESIGN_CEILING", "").strip()
+    try:
+        return float(raw) if raw else None
+    except ValueError:
+        return None
+
+
+FAILURE_CLASSES = ("no_code", "truncated", "no_delta", "rejected_delta",
+                   "duplicate", "verification", "oom", "runtime", "unknown")
+
+
+def classify_failures(models_dir):
+    """Why each generation produced no usable model.
+
+    `valid_rate` alone cannot be acted on: a cycle losing models to truncation
+    needs a bigger budget, one losing them to duplicates needs a different
+    sampler, and one losing them to OOM needs the trainer off the card. Those
+    are three different bugs behind one number.
+    """
+    counts = {k: 0 for k in FAILURE_CLASSES}
+    models_dir = Path(models_dir)
+    if not models_dir.is_dir():
+        return counts
+    for d in sorted(models_dir.iterdir()):
+        if not d.is_dir():
+            continue
+        if (d / "eval_info.json").is_file():
+            continue
+        out = ""
+        out_path = d / "full_output.txt"
+        if out_path.is_file():
+            try:
+                out = out_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                out = ""
+        err = ""
+        err_path = d / "error.txt"
+        if err_path.is_file():
+            try:
+                err = err_path.read_text(encoding="utf-8", errors="replace").lower()
+            except Exception:
+                err = ""
+        if err:
+            if "already exists" in err or "checksum" in err:
+                counts["duplicate"] += 1
+            elif "out of memory" in err or "cuda" in err:
+                counts["oom"] += 1
+            else:
+                counts["runtime"] += 1
+        elif (d / "eval_verification_failed.txt").is_file():
+            counts["verification"] += 1
+        elif not (d / "new_nn.py").is_file():
+            if out and "<delta>" in out and "</delta>" in out:
+                counts["rejected_delta"] += 1
+            elif out and ("<nn>" in out or "<hp>" in out) and "</delta>" not in out:
+                counts["no_delta"] += 1
+            elif out:
+                counts["truncated"] += 1
+            else:
+                counts["no_code"] += 1
+        else:
+            counts["unknown"] += 1
+    return counts
+
+
 def collect_epoch_stats(models_dir, epoch):
     """Build the statistics record for one epoch from its model directories.
 
@@ -186,9 +256,20 @@ def collect_epoch_stats(models_dir, epoch):
     # treating the two means as independent samples.
     delta = mean_ci(deltas)
 
+    ceiling = _corpus_ceiling()
+    above = [a for a in accuracies if ceiling is not None and a > ceiling]
+    failures = classify_failures(models_dir)
+
     return {
         "epoch": epoch,
         "timestamp": datetime.now().isoformat(),
+        # The objective is the tail, not the mean: one model above the corpus
+        # ceiling is the whole point of a cycle, and a mean that moved while
+        # the max did not is not progress toward it.
+        "cycle_max": gen["max"],
+        "corpus_ceiling": ceiling,
+        "n_above_ceiling": len(above),
+        "failures": failures,
         "models_generated": generated,
         "models_valid": valid,
         "models_failed": failed,
@@ -263,14 +344,44 @@ def _run_config(base_dir):
 
 
 #: Display order for the fine-tuning settings. Anything in run_config.json that
-#: is not listed is appended, so a newly recorded setting still appears.
+#: is not listed is appended, so a newly recorded setting still appears. The
+#: settings belonging to a PARAM_TRAILING group are not listed here: a group
+#: fixes the order of its own members, and naming them twice would leave two
+#: places to look when one of them moves.
 PARAM_ORDER = (
-    "learning_rate", "lr_scheduler", "warmup_steps", "num_train_epochs", "cycles",
-    "optimizer", "lora_r", "lora_alpha", "lora_dropout",
-    "per_device_train_batch_size", "gradient_accumulation_steps",
-    "max_prompts", "sft_max_length", "context_length", "max_new_tokens",
+    "learning_rate", "lora_dropout", "per_device_train_batch_size",
+    "lr_scheduler", "warmup_steps",
+    "optimizer", "lora_r", "lora_alpha",
+    "gradient_accumulation_steps",
+    "max_prompts",
     "test_nn", "load_in_4bit", "unsloth", "vllm_sleep",
 )
+
+#: How long the run was meant to be: the number of fine-tuning cycles planned,
+#: and the epochs trained within each. The x axis counts the cycles that
+#: finished, which is a different number whenever a run is still going or
+#: stopped early -- three points under cycles=10 is an unfinished run, and
+#: without the plan there is nothing on the figure that says so. The two are
+#: multiplied to get the epochs trained in total, so they stand together.
+PARAM_SCHEDULE = ("cycles", "num_train_epochs")
+
+#: The budgets measured in tokens: what a training example is truncated to,
+#: what the model is given, and what it may produce. One quantity in three
+#: places, and only meaningful against each other -- a context of 8192 says
+#: nothing until it is read next to an output budget of the same size.
+PARAM_TOKENS = ("sft_max_length", "context_length", "max_new_tokens")
+
+#: Sampling is not fine-tuning: temperature, top_k and top_p act on the
+#: finished model at generation time, and standing among the optimiser's
+#: numbers they invite a reader to compare them with a learning rate or a rank.
+#: In the order they apply -- the distribution is tempered, then truncated to a
+#: count, then to a mass -- so the line reads as the pipeline it describes.
+PARAM_TAIL = ("temperature", "top_k", "top_p")
+
+#: Groups lifted out of the main ordering and set down at the end of the line,
+#: in this order, after the named settings. Each is a block that is read as a
+#: block, which the one-per-setting ordering above cannot express.
+PARAM_TRAILING = (PARAM_SCHEDULE, PARAM_TOKENS, PARAM_TAIL)
 
 #: Short labels so the whole configuration fits on one line; the settings
 #: themselves are unabridged.
@@ -289,23 +400,48 @@ PARAM_LABEL = {
     "max_prompts": "prompts",
     "context_length": "ctx",
     "max_new_tokens": "new_tok",
+    "temperature": "temp",
+    "top_k": "top_k",
+    "top_p": "top_p",
     "sft_max_length": "sft_len",
     "load_in_4bit": "4bit",
 }
 
 #: Recorded settings that are not hyper-parameters of the fine-tuning, or that
-#: the figure already states. ``cycles`` is the length of the x axis and
-#: ``test_nn`` is the denominator of every label on the upper panel, so naming
-#: them again in the caption only costs line width. The runtime switches say
-#: nothing about the optimisation that produced these curves.
-PARAM_SKIP = ("cycles", "test_nn", "unsloth", "vllm_sleep")
+#: the figure already states. ``test_nn`` is the denominator of every label on
+#: the upper panel, so naming it again in the caption only costs line width.
+#: The runtime switches say nothing about the optimisation that produced these
+#: curves.
+PARAM_SKIP = ("test_nn", "unsloth", "vllm_sleep")
 
 #: Settings whose value is a plain on/off. Shown by name when enabled and left
 #: out entirely when not: "4bit=no" is the default state and reads as a
 #: parameter that was chosen, which it was not.
 PARAM_FLAGS = ("load_in_4bit",)
 
-PARAM_MAX_CHARS = 170
+#: Width budget for the configuration line, in characters, paired with the
+#: point size it is drawn at: at 5.8pt in PARAM_FONTFAMILY, 194 characters span
+#: 94% of the 10in figure, or 97% once the glyphs are hinted, which is what
+#: most installs draw. Both clear the panels, which end well inside that.
+#: Changing one without the other either wraps the line or lets it run past the
+#: figure. Point size is no longer a dial here: hinting rounds the advance to
+#: whole pixels, so 5.8 and 5.4 come out at the same width.
+#:
+#: Every setting added to the line has been paid for in point size, and this is
+#: close to the floor: below ~5.5pt the figures stop resolving in print. The
+#: next addition should take a setting out, shorten a label, or accept two
+#: lines, rather than shrink this again.
+PARAM_MAX_CHARS = 194
+PARAM_FONTSIZE = 5.8
+
+#: The face that budget is measured in. "monospace" resolves to whatever the
+#: host has installed, and the wider ones push a full line past the panels.
+#: DejaVu ships with matplotlib, so the budget holds on every machine.
+PARAM_FONTFAMILY = "DejaVu Sans Mono"
+
+#: Near-black rather than a grey: the line is the only record of what produced
+#: the curves, and at this size a lightened grey stops being legible in print.
+PARAM_COLOR = "#111111"
 
 #: Clearance between the caption and the first panel's title. Enough to
 #: separate them, not enough to read as a break in the figure.
@@ -339,12 +475,16 @@ def _param_block(training, max_chars=PARAM_MAX_CHARS):
     the named ones -- the schedule, the optimiser, the quantisation -- are
     collected at the end. A number is read by comparing it with its neighbours,
     which only works while the numbers sit together; a name interrupting the
-    run forces the eye to re-anchor on every value after it.
+    run forces the eye to re-anchor on every value after it. The PARAM_TRAILING
+    groups come last of all, after the names, each kept whole: they are read
+    against their own members rather than against the optimiser's settings.
     """
     if not training:
         return []
-    keys = [k for k in PARAM_ORDER if k in training and k not in PARAM_SKIP]
-    keys += [k for k in training if k not in PARAM_ORDER and k not in PARAM_SKIP]
+    trailing_keys = {k for group in PARAM_TRAILING for k in group}
+    skip = set(PARAM_SKIP) | trailing_keys
+    keys = [k for k in PARAM_ORDER if k in training and k not in skip]
+    keys += [k for k in training if k not in PARAM_ORDER and k not in skip]
 
     numeric, named = [], []
     for k in keys:
@@ -357,7 +497,11 @@ def _param_block(training, max_chars=PARAM_MAX_CHARS):
         cell = f"{label}={_fmt_value(value)}"
         (numeric if _is_numeric(value) else named).append(cell)
 
-    cells = numeric + named
+    trailing = [f"{PARAM_LABEL.get(k, k)}={_fmt_value(training[k])}"
+                for group in PARAM_TRAILING for k in group
+                if k in training and training[k] is not None]
+
+    cells = numeric + named + trailing
     if not cells:
         return []
     line = " ".join(cells)
@@ -386,6 +530,80 @@ def _dataset_phrase(names):
     return ", ".join(seen[:-1]) + " and " + seen[-1]
 
 
+#: Point sizes the study line may be set at, largest first. It is one line in
+#: a band of fixed height, so when the text outgrows the figure the size comes
+#: down rather than the line wrapping -- wrapping would need vertical room the
+#: header does not have, and the configuration line below is already at the
+#: floor of its own size. The smallest here still reads beside an 8.8pt line.
+STUDY_FONTSIZES = (8.8, 8.2, 7.6, 7.0, 6.6)
+
+#: The width the study line may occupy, as a fraction of the figure. The same
+#: budget the configuration line is held to, so the two end at the same margin.
+STUDY_MAX_WIDTH = 0.94
+
+
+def _fit_fontsize(fig, text, sizes=STUDY_FONTSIZES, max_width=STUDY_MAX_WIDTH,
+                  **kwargs):
+    """The largest of ``sizes`` at which ``text`` fits within ``max_width``.
+
+    Measured rather than estimated from the character count: this line is set
+    in a proportional face, where a dataset list of i's and a config name of
+    w's of equal length are nowhere near equal width.
+    """
+    renderer = fig.canvas.get_renderer()
+
+    def measure(size):
+        probe = fig.text(0.5, 0.5, text, ha="center", fontsize=size, **kwargs)
+        width = probe.get_window_extent(renderer=renderer).width / fig.bbox.width
+        probe.remove()
+        return width
+
+    for size in sizes:
+        if measure(size) <= max_width:
+            return size
+
+    # Nothing in the ladder fits -- a wider face than the one the sizes were
+    # chosen against. Width is linear in point size, so the smallest is scaled
+    # to the budget rather than left to run past the axes.
+    width = measure(sizes[-1])
+    if not width:
+        return sizes[-1]
+    return max(0.1, math.floor(sizes[-1] * max_width / width * 10) / 10)
+
+
+#: Separator between the statement of the study and the prompts it was run
+#: with. A middle dot rather than a comma or a dash: the two are not one
+#: sentence, and the eye should be able to stop between them.
+STUDY_JOIN = "  \u00b7  "
+
+
+def _prompt_phrase(config):
+    """The two prompt configs by name: what it was tuned on, what it generates.
+
+    Two runs of identical hyper-parameters on different prompts produce
+    different curves, and nothing else on the figure tells them apart. The
+    .json is dropped -- every one of them is a .json, so the extension is four
+    characters that distinguish nothing -- and a config named for both roles is
+    stated once rather than twice.
+    """
+    prompts = config.get("prompts")
+    if not isinstance(prompts, dict):
+        return ""
+
+    def _name(key):
+        value = str(prompts.get(key) or "").strip()
+        return Path(value).stem if value else ""
+
+    train, test = _name("train"), _name("test")
+    if not train and not test:
+        return ""
+    if train == test:
+        return f"prompts {train}"
+    if train and test:
+        return f"prompts train {train}, test {test}"
+    return f"prompts train {train}" if train else f"prompts test {test}"
+
+
 def _study_sentence(config, rows):
     """One-sentence statement of what the figure reports.
 
@@ -403,12 +621,19 @@ def _study_sentence(config, rows):
 
     subject = "Automated generation of neural network architectures"
     if task and data:
-        return f"{subject} for {task} on {data}"
-    if task:
-        return f"{subject} for {task}"
-    if data:
-        return f"{subject} evaluated on {data}"
-    return subject
+        sentence = f"{subject} for {task} on {data}"
+    elif task:
+        sentence = f"{subject} for {task}"
+    elif data:
+        sentence = f"{subject} evaluated on {data}"
+    else:
+        sentence = subject
+
+    # Appended here rather than given a line of its own: this line is half the
+    # width of the figure and the configuration line below it is at the floor
+    # of its point size, so the room already exists on exactly one of them.
+    prompts = _prompt_phrase(config)
+    return f"{sentence}{STUDY_JOIN}{prompts}" if prompts else sentence
 
 
 def _run_caption(config, rows):
@@ -424,6 +649,205 @@ def _run_caption(config, rows):
     model = str(model).rstrip("/").split("/")[-1].replace(".json", "")
     return (model, _study_sentence(config, rows),
             _param_block(config.get("training") or {}))
+
+
+def _parse_time(value):
+    """A recorded timestamp, or None if it is missing or unreadable."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _run_duration(config, rows):
+    """Wall-clock seconds from the start of the run to its last epoch.
+
+    The start is the stamp written when the run began; the end is the last
+    epoch's own timestamp rather than the clock now, so re-drawing the figure
+    a week later reports what the run cost and not how long ago it was.
+
+    A run resumed with --peft or --skip_epoches stamps a new start over the
+    old one while keeping the earlier epochs in the tracker, so the earliest
+    of the two is taken: the figure shows every epoch it plots, and the
+    duration covers all of them. It is also why this cannot come out negative.
+    """
+    stamps = [t for t in (_parse_time(r.get("timestamp")) for r in rows) if t]
+    if not stamps:
+        return None
+    started = _parse_time(config.get("started_at"))
+    first = min(stamps + ([started] if started else []))
+    seconds = (max(stamps) - first).total_seconds()
+    return seconds if seconds >= 0 else None
+
+
+def _fmt_duration(seconds):
+    """Days, hours and minutes, with the leading empty units left off.
+
+    A run of twenty minutes written 0d.00h.20m makes a reader count zeros to
+    find the one number that is there, so the units only appear once they have
+    a value. Seconds are not shown: nothing on this figure is decided by them.
+    """
+    if seconds is None:
+        return ""
+    if seconds < 60:
+        return "<1m"
+    minutes = int(seconds // 60)
+    days, rest = divmod(minutes, 24 * 60)
+    hours, minutes = divmod(rest, 60)
+    if days:
+        return f"{days}d.{hours:02d}h.{minutes:02d}m"
+    if hours:
+        return f"{hours}h.{minutes:02d}m"
+    return f"{minutes}m"
+
+
+def _fmt_span(seconds):
+    """One cycle's cost, in the largest unit that fits, at a glance width.
+
+    A tick label is read in passing, so it carries one number: 11h, 2.4h, 45m.
+    The decimal appears only below ten of a unit, where dropping it would be a
+    real error -- 1.5d rounded to 2d overstates the cycle by a third -- and
+    disappears above it, where the extra digit buys nothing.
+    """
+    if seconds is None or seconds < 0:
+        return ""
+    if seconds < 60:
+        return "<1m"
+    minutes = seconds / 60.0
+    if minutes < 90:
+        return f"{int(round(minutes))}m"
+    hours = minutes / 60.0
+    if hours < 36:
+        return _scaled(hours, "h")
+    return _scaled(hours / 24.0, "d")
+
+
+def _scaled(value, unit):
+    """One decimal below ten, none above it, and never a trailing ".0"."""
+    if value >= 10 or round(value, 1) == round(value):
+        return f"{int(round(value))}{unit}"
+    return f"{value:.1f}{unit}"
+
+
+def _cycle_durations(config, rows):
+    """How long each plotted cycle took, in the order the rows are drawn.
+
+    A row's timestamp is the moment its cycle finished, so a cycle is measured
+    from the end of the one before it -- and the first from the start of the
+    run, which is the only place its own beginning is recorded.
+
+    A missing or unreadable stamp is a missing boundary, and it costs both of
+    the cycles that share it: the one that ends there and the one that starts
+    there. Carrying the last good stamp forward instead would charge the whole
+    gap to the next cycle, so a stats run repeated days later would show up as
+    days of work.
+    """
+    previous = _parse_time(config.get("started_at"))
+    spans = []
+    for row in rows:
+        stamp = _parse_time(row.get("timestamp"))
+        if stamp is None or previous is None or stamp < previous:
+            spans.append(None)
+        else:
+            spans.append((stamp - previous).total_seconds())
+        previous = stamp
+    return spans
+
+
+#: Size and colour of the per-cycle durations under the x axis. Quieter and
+#: smaller than the cycle numbers: the number is what a point is identified by
+#: and the duration is a note about it, and at equal weight the axis reads as
+#: two rows of numbers with no way to tell which is which.
+SPAN_FONTSIZE = 6.5
+SPAN_COLOR = "#6b7177"
+
+#: Clearance between the tick labels and the durations under them, in axes
+#: fractions.
+SPAN_GAP = 0.012
+
+#: Height to reserve under the tick labels for a row of durations, in points:
+#: the line itself plus the gaps on either side of it. Added to the axis
+#: label's padding BEFORE the layout is computed, because tight_layout sizes
+#: the figure from that padding -- claimed afterwards, the room comes off the
+#: bottom of the figure and the axis label is cut in half.
+#:
+#: Calibrated, not derived: at 15.0pt the axis label clears the durations by
+#: 3.4mm on the 10x9in figure. SPAN_LABEL_CLEARANCE_MM is the floor it is held
+#: to, and a test measures the rendered figure against it, because the gap
+#: depends on font metrics that no formula here can see.
+SPAN_RESERVE = 15.0
+
+#: The least space the axis label may leave under the durations. Below this
+#: the two rows read as one block and the label stops looking like a label.
+SPAN_LABEL_CLEARANCE_MM = 3.0
+
+
+def _reserve_cycle_spans(ax):
+    """Make room under the tick labels, before the layout is computed."""
+    ax.xaxis.labelpad = ax.xaxis.labelpad + SPAN_RESERVE
+
+
+def _draw_cycle_spans(ax, positions, spans):
+    """The time each cycle took, under its tick.
+
+    Placed by measuring the tick labels rather than at a fixed offset: the
+    offset that clears a 10pt number does not clear a larger one, and the
+    figure has been re-sized more than once. Call this after the layout is
+    settled -- an axes fraction means a different number of pixels before and
+    after tight_layout, and these texts have to clear real rendered glyphs.
+    """
+    cells = [(x, _fmt_span(span)) for x, span in zip(positions, spans)]
+    cells = [(x, t) for x, t in cells if t]
+    if not cells:
+        return False
+
+    ax.get_figure().canvas.draw()          # tick labels have no extent undrawn
+    to_axes = ax.transAxes.inverted()
+    bottoms = [to_axes.transform((0, label.get_window_extent().y0))[1]
+               for label in ax.get_xticklabels() if label.get_text()]
+    top = (min(bottoms) if bottoms else -0.026) - SPAN_GAP
+
+    for x, text in cells:
+        ax.text(x, top, text, transform=ax.get_xaxis_transform(),
+                ha="center", va="top", fontsize=SPAN_FONTSIZE,
+                color=SPAN_COLOR, family="monospace", clip_on=False)
+    return True
+
+
+#: What one point on the x axis is. The tracker calls it an epoch and its
+#: records still do -- the key is "epoch", the file is epoch_tracker.json, and
+#: renaming those would strand every tracker already written -- but the figure
+#: says cycle, because that is what it is: one round of generation, training
+#: and evaluation, containing ep/cyc training epochs, which the caption states.
+#: Calling both an epoch left the figure claiming a run of four epochs when it
+#: had trained twenty.
+AXIS_LABEL = "cycle"
+
+#: Label on the run time, so the figure says what the number measures. Without
+#: it a duration in the corner reads as a deadline, a budget or an age.
+RUNTIME_LABEL = "run time"
+
+
+#: The run time is set darker than the project mark beside it. The mark is an
+#: imprint and may recede; this is a number meant to be read, and at the mark's
+#: own grey it sat at 2.2:1 against white -- legible on a screen at full size,
+#: not in a printed figure or a slide. #53585e is 7.2:1 and still quiet.
+RUNTIME_COLOR = "#53585e"
+
+
+def _draw_runtime(fig, text):
+    """The run's wall-clock duration, top-left, mirroring the project mark.
+
+    Set in the same quiet grey and on the same band: it identifies the run
+    rather than reporting a result, and drawn any heavier it would compete
+    with the accuracies for attention.
+    """
+    if not text:
+        return
+    fig.text(0.0115, 0.9955, f"{RUNTIME_LABEL}  {text}", ha="left", va="top",
+             fontsize=7.5, color=RUNTIME_COLOR, family="monospace", zorder=0)
 
 
 #: Project mark set in the top-right corner, on the band occupied by the title
@@ -449,6 +873,371 @@ def _draw_brand(fig, text=BRAND_TEXT):
         (right - rule, top - 0.0135), rule, 0.0016,
         transform=fig.transFigure, facecolor=BRAND_ACCENT,
         edgecolor="none", alpha=0.55, zorder=0))
+
+
+#: Figure width, and the height of a figure carrying the two standard panels.
+#: The header offsets below are figure fractions, so a taller figure would
+#: otherwise shrink the caption band in absolute terms: they are scaled by
+#: BASE_HEIGHT / height to keep the band the same size on every variant.
+FIG_WIDTH = 10.0
+BASE_HEIGHT = 9.0
+
+#: Height added for the improvement panel, matching the two above it.
+PANEL_HEIGHT = 3.6
+
+# Grey means "the original networks, before the LLM changed them" on every
+# panel; green means the networks the LLM produced. Both are measurements of
+# the same kind, so both are drawn solid and filled -- only the colour
+# separates them. Module level because the rate panel names them too.
+GENERATED, ORIGINAL = "#2ca02c", "#7f7f7f"
+# The best generated network is the headline number, so it gets its own colour
+# rather than sharing green with the mean. A mid red sits ~ΔE 4 from this green
+# under deuteranopia -- the classic red/green confusion -- so the red is taken
+# dark enough to clear the threshold: #9d0208 separates at ΔE 10.5, leaving
+# grey-vs-green as the worst pair on the panel.
+BEST = "#9d0208"
+
+#: Colour of the valid-generation rate, which is a property of the run rather
+#: than of either cohort, so it takes neither cohort's colour.
+RATE = "#1f77b4"
+
+
+#: Reading order of a legend: the headline first, then the typical case, then
+#: the uncertainty around it. A reader looking for one number finds it in the
+#: first entry rather than scanning for it, and an entry's rank is the same on
+#: every panel, so the legends are read the same way.
+LEGEND_RANK = ("best", "mean", "CI")
+
+
+def _legend_rank(label):
+    """0 for a best, 1 for a typical value, 2 for an interval.
+
+    The interval is tested first: "best-of-5 Δ 95% CI" names a best and is an
+    interval, and it belongs with the other intervals -- ranked on the word
+    "best" it would have led the legend, putting a band where the reader is
+    looking for the headline number.
+    """
+    lowered = label.lower()
+    if "ci" in lowered.split() or "95%" in lowered:
+        return 2
+    if "best" in lowered:
+        return 0
+    return 1
+
+
+def _draw_legend(ax, **kwargs):
+    """The panel's legend, ordered best, then mean, then interval.
+
+    Sorted stably, so within a rank the artists keep the order they were drawn
+    in -- which is original before generated, the convention the rest of the
+    figure follows.
+    """
+    handles, labels = ax.get_legend_handles_labels()
+    if not handles:
+        return None
+    order = sorted(range(len(labels)), key=lambda i: _legend_rank(labels[i]))
+    return ax.legend([handles[i] for i in order], [labels[i] for i in order],
+                     framealpha=0.75, fancybox=False, fontsize=8, **kwargs)
+
+
+#: Size and colour of the note under the figure. Small and grey: it is read
+#: once, when a reader meets an unfamiliar name, and never again.
+NOTE_FONTSIZE = 6.8
+NOTE_COLOR = "#53585e"
+
+#: Width the note is wrapped to, as a fraction of the figure, and the line
+#: height it is set at. The height of the strip reserved for it follows from
+#: the number of lines it wraps to, so a longer note is never cut off.
+NOTE_WIDTH = 0.90
+NOTE_LINESPACING = 1.5
+
+#: The one quantity on the figure a reader cannot infer: its name, the formula
+#: it is computed by, and where that formula is defined. Everything else is
+#: named in terms anyone reading the figure already has -- a mean, a maximum,
+#: a Wilson or a 95% confidence interval -- and glossing those would bury the
+#: one line worth reading.
+#:
+#: "best-of-k" is the plain name; the formal one is the U-statistic with
+#: kernel max, which is what to look for in the reference. Hoeffding defines
+#: U_n as the mean of a kernel over all C(n, m) subsamples of size m -- with
+#: the kernel taken to be the maximum, that definition IS the expression
+#: below, and the weights C(i-1, k-1) are only that mean collected per
+#: distinct value: the i-th smallest is the largest of exactly C(i-1, k-1) of
+#: the C(n, k) subsamples.
+#:
+#: Lines beginning with "$" are set as display formulas: indented, not
+#: wrapped, and given the room a fraction needs. The rest is prose and wraps.
+NOTE_LINES = (
+    "Best-of-{k} difference:",
+    r"$\Delta_{k} = E_{k}(\mathrm{{generated}}) - E_{k}(\mathrm{{original}})$",
+    "where $E_k$ is the expected maximum accuracy over all size-$k$ subsets "
+    "of the $n$ model accuracies:",
+    r"$E_k = \sum_{{i=k}}^{{n}} x_{{(i)}}\, "
+    r"\dfrac{{\binom{{i-1}}{{k-1}}}}{{\binom{{n}}{{k}}}}$",
+    "with $x_{{(1)}} \\leq \\cdots \\leq x_{{(n)}}$ the sorted accuracies. "
+    "This is a U-statistic with the maximum as its kernel "
+    "(Hoeffding, 1948, Ann. Math. Statist. 19(3), 293-325).",
+    "Fixing $k={k}$ enables fair comparison across cycles with different "
+    "numbers of valid models. \u201cPooled so far\u201d calculates the metric "
+    "over all generated model pairs accumulated up to each cycle.",
+)
+
+#: Indent of a display formula, as a fraction of the figure.
+NOTE_MATH_INDENT = 0.030
+
+#: Line height of a display formula, relative to a line of prose: a sum with a
+#: fraction under it is three times the height of a word.
+NOTE_MATH_LEADING = 2.6
+
+
+def _figure_note(improved, k):
+    """The note's lines, or () when there is nothing to explain."""
+    if not (improved and k):
+        return ()
+    return tuple(line.format(k=k) for line in NOTE_LINES)
+
+
+def _is_math(line):
+    return line.startswith("$")
+
+
+def _wrap_note(fig, lines, width=NOTE_WIDTH):
+    """The note's lines, prose broken to fit ``width``, formulas left whole.
+
+    A formula cannot be wrapped -- half of a sum is not a formula -- so it is
+    passed through and only the prose is measured. Measuring rather than
+    counting characters: the note is set in a proportional face, and a
+    character budget right for one sentence is wrong for the next.
+    """
+    renderer = fig.canvas.get_renderer()
+
+    def _fits(candidate):
+        probe = fig.text(0.0, 0.0, candidate, fontsize=NOTE_FONTSIZE)
+        spans = probe.get_window_extent(renderer=renderer).width / fig.bbox.width
+        probe.remove()
+        return spans <= width
+
+    out = []
+    for line in lines:
+        if _is_math(line):
+            out.append(line)
+            continue
+        current = ""
+        for word in line.split():
+            trial = f"{current} {word}".strip()
+            if current and not _fits(trial):
+                out.append(current)
+                current = word
+            else:
+                current = trial
+        if current:
+            out.append(current)
+    return out
+
+
+#: Space between two lines of the note, in points. Enough to separate them,
+#: and not the extra half-line a formula's own height already provides.
+NOTE_GAP_PT = 2.4
+
+
+def _note_layout(fig, lines):
+    """Each line's rendered height in inches, and the strip they need.
+
+    Measured, not assumed. A sum with a fraction under it stands roughly three
+    times the height of a word, and the two differ again between a formula
+    with limits and one without, so a single leading either collides the
+    formulas with the prose or leaves a hole under the figure.
+    """
+    if not lines:
+        return [], 0.0
+    renderer = fig.canvas.get_renderer()
+    heights = []
+    for line in lines:
+        probe = fig.text(0.0, 0.0, line, fontsize=NOTE_FONTSIZE)
+        heights.append(probe.get_window_extent(renderer=renderer).height
+                       / fig.dpi)
+        probe.remove()
+    gap = NOTE_GAP_PT / 72.0
+    return heights, sum(heights) + gap * (len(heights) + 1) + 0.06
+
+
+def _note_height_in(lines, fig=None):
+    """Inches of figure to keep free for ``lines``, margin included."""
+    if not lines:
+        return 0.0
+    if fig is None:                       # no renderer: a prose-leading guess
+        return (len(lines) * NOTE_FONTSIZE * NOTE_LINESPACING) / 72.0 + 0.12
+    return _note_layout(fig, lines)[1]
+
+
+def _draw_note(fig, lines):
+    """Set the note at the foot of the figure, formulas indented under it.
+
+    Drawn line by line rather than as one block: the lines do not share a
+    leading, and a formula is indented the way a displayed equation is in a
+    paper. Each is given exactly the height it renders at, stacked downward
+    from the top of the strip, so nothing overlaps and nothing falls off.
+    """
+    if not lines:
+        return
+    heights, total = _note_layout(fig, lines)
+    inches = fig.get_size_inches()[1]
+    gap = NOTE_GAP_PT / 72.0
+    y = total - gap
+    for line, line_height in zip(lines, heights):
+        y -= line_height
+        fig.text(0.012 + (NOTE_MATH_INDENT if _is_math(line) else 0.0),
+                 y / inches, line, ha="left", va="bottom",
+                 fontsize=NOTE_FONTSIZE, color=NOTE_COLOR)
+        y -= gap
+
+
+#: Largest k used for the best-of-k figures. Small on purpose: k has to be no
+#: larger than the smallest cycle's paired count, and a run evaluates about ten
+#: models a cycle of which only some pair, so anything larger would be cut down
+#: to the smallest cycle anyway and read as a promise the data cannot keep.
+BEST_OF_K_CAP = 5
+
+
+def _pairs(row):
+    """(original, generated) accuracies of every model this cycle paired.
+
+    ``baseline_seeds`` already carries the per-model pairing that the summary
+    statistics were computed from, so the tail metrics below need nothing new
+    collected -- only an older tracker, written before that field existed, has
+    nothing to offer here.
+    """
+    out = []
+    for pair in row.get("baseline_seeds") or []:
+        before, after = pair.get("baseline_accuracy"), pair.get("accuracy")
+        if before is not None and after is not None:
+            out.append((float(before), float(after)))
+    return out
+
+
+def expected_best_of_k(values, k):
+    """Expected maximum of ``k`` of ``values``, drawn without replacement.
+
+    The maximum of a cycle is not comparable with the maximum of another one
+    unless both were drawn from the same number of models: more attempts raise
+    the best result on their own, and the valid count moves from cycle to
+    cycle. Fixing k and averaging the best-of-k over every size-k subset takes
+    that out. Computed from the order statistics rather than by sampling --
+    the i-th smallest value is the maximum of exactly C(i-1, k-1) of the
+    C(n, k) subsets -- so it is exact and costs one pass.
+
+    This is the estimator pass@k is built on, applied to a continuous score
+    instead of a success flag.
+    """
+    values = sorted(float(v) for v in values if v is not None)
+    n = len(values)
+    if n == 0 or k < 1:
+        return None
+    if k >= n:
+        return values[-1]
+    total = math.comb(n, k)
+    return sum(v * math.comb(i, k - 1)
+               for i, v in enumerate(values)) / total
+
+
+def _common_k(rows, cap=BEST_OF_K_CAP):
+    """One k for the whole figure, so its cycles can be compared.
+
+    The smallest cycle sets it: a best-of-5 cannot be formed where only three
+    models paired, and quietly falling back to the maximum for that one cycle
+    would reintroduce exactly the dependence on sample size this removes.
+    """
+    counts = [len(_pairs(r)) for r in rows]
+    counts = [c for c in counts if c]
+    if not counts:
+        return None
+    return max(1, min(cap, min(counts)))
+
+
+def _best_of_k_from_pairs(pairs, k):
+    """Expected best-of-k generated, minus expected best-of-k original.
+
+    Both cohorts are reduced the same way, so the difference says what the
+    best of a fixed number of attempts gained -- not what the luckiest draw of
+    a larger sample did.
+    """
+    if not pairs or not k:
+        return None
+    after = expected_best_of_k([a for _, a in pairs], k)
+    before = expected_best_of_k([b for b, _ in pairs], k)
+    if after is None or before is None:
+        return None
+    return after - before
+
+
+def _best_of_k_delta(row, k):
+    return _best_of_k_from_pairs(_pairs(row), k)
+
+
+#: Resamples behind the best-of-k interval, and the seed they are drawn with.
+#: Fixed, so the same tracker always draws the same figure: an interval that
+#: moved every time the plot was refreshed would be read as the run changing.
+BOOTSTRAP_N = 2000
+BOOTSTRAP_SEED = 20260101
+
+
+def _best_of_k_ci(pairs, k, conf=0.95, draws=BOOTSTRAP_N):
+    """Percentile bootstrap interval for the best-of-k difference.
+
+    An interval is possible here and impossible for the observed maximum
+    beside it, and the reason is worth stating: best-of-k with k below n is a
+    weighted average of the order statistics, which the bootstrap estimates
+    consistently, whereas the maximum sits on the edge of the sample and the
+    bootstrap is known to fail for it (Bickel and Freedman, 1981).
+
+    The PAIRS are resampled, not the two cohorts separately, so a resample is
+    a plausible redrawing of the same experiment: each model keeps the
+    original it was made from.
+    """
+    n = len(pairs)
+    if n < 2 or not k:
+        return None, None
+    rng = random.Random(BOOTSTRAP_SEED)
+    deltas = []
+    for _ in range(draws):
+        sample = [pairs[rng.randrange(n)] for _ in range(n)]
+        value = _best_of_k_from_pairs(sample, k)
+        if value is not None:
+            deltas.append(value)
+    if len(deltas) < draws // 2:
+        return None, None
+    deltas.sort()
+    tail = (1.0 - conf) / 2.0
+    lo = deltas[max(0, int(math.floor(tail * len(deltas))))]
+    hi = deltas[min(len(deltas) - 1, int(math.ceil((1.0 - tail) * len(deltas))) - 1)]
+    return lo, hi
+
+
+def _cumulative_pairs(rows):
+    """Every pair up to and including each cycle, cycle by cycle.
+
+    The tail of a cycle rests on about ten models, which is few for a question
+    about the best of them. Pooling what the run has produced so far answers
+    the same question over a sample that grows with the run, and it is the
+    quantity panel 2's "best so far" tracks without an estimate attached.
+    """
+    pooled, out = [], []
+    for row in rows:
+        pooled = pooled + _pairs(row)
+        out.append(list(pooled))
+    return out
+
+
+def _paired_improvement(rows):
+    """Rows carrying a paired generated-minus-original difference.
+
+    The difference exists only where the prompt carried an initial network AND
+    its descendant ran: ``collect_epoch_stats`` pairs them per model and leaves
+    ``mean_improvement`` as None when there is nothing to pair. A run that
+    generates from scratch therefore has no third panel rather than a panel of
+    blanks, and an older tracker without the field behaves the same way.
+    """
+    return [r for r in rows if r.get("mean_improvement") is not None]
 
 
 def _value_limits(values, lo_bound=0.0, hi_bound=1.0, headroom=0.18):
@@ -502,7 +1291,56 @@ CI_ALPHA = 0.22
 #: reads as a small grey marker centred on a larger coloured one.
 MEAN_MARKER = ((5.5, 6), (9.0, 5))
 BEST_MARKER = ((5.0, 7), (8.0, 6))
+
+#: Stacking of the two running bests, above every per-cycle series.
+#:
+#: A running best coincides with the per-cycle best of its own cohort for as
+#: long as no later cycle beats an earlier one -- which is most of a run, and
+#: is the whole of it for the original networks whenever the seed pool does
+#: not change. Drawn underneath, as these were, the dotted line is covered by
+#: the dashed one exactly when it has nothing to add, which reads as the line
+#: being missing rather than as the two agreeing. On top, the dots sit over
+#: the dashes and the agreement is visible.
+RUNNING_ZORDER = 8
 MARKER_EDGE = dict(markeredgecolor="white", markeredgewidth=0.7)
+
+
+def _annotate_peak(ax, xs, ys, colour, lo_limit, hi_limit, other=None):
+    """Label a series' highest point with its value.
+
+    Placed against the settled view limits so it stays on the panel wherever
+    the peak falls -- pushed inward at the first and last cycle, where a
+    centred label would cross a spine, and dropped under the marker when the
+    peak is near the top of the panel.
+
+    ``other`` is the companion series, used only to pick a side: whichever of
+    the two is higher at that cycle takes the space above and the other takes
+    the space below, so the two labels cannot land on each other when both
+    cohorts peak on the same cycle.
+    """
+    if not ys:
+        return
+    peak = max(range(len(ys)), key=lambda i: ys[i])
+    span = max(hi_limit - lo_limit, 1e-9)
+
+    above = (ys[peak] - lo_limit) / span <= 0.82
+    if other is not None:
+        other_x, other_y = other
+        at_peak = [v for x, v in zip(other_x, other_y) if x == xs[peak]]
+        if at_peak and at_peak[0] > ys[peak]:
+            above = False                  # the companion owns the space above
+
+    if peak == len(xs) - 1:
+        dx, ha = -9, "right"
+    elif peak == 0:
+        dx, ha = 9, "left"
+    else:
+        dx, ha = 0, "center"
+    dy, va = (9, "bottom") if above else (-10, "top")
+    ax.annotate(f"best {ys[peak]:.4f}", (xs[peak], ys[peak]),
+                textcoords="offset points", xytext=(dx, dy), ha=ha, va=va,
+                fontsize=8, color=colour, fontweight="bold", zorder=7,
+                annotation_clip=False)
 
 
 def _draw_band(ax, xs, lo, hi, line_colour, fill_colour, alpha, label):
@@ -559,12 +1397,21 @@ def plot_epoch_stats(rows, out_path, base_dir=None):
         return None
     ep = [r["epoch"] for r in rows]
 
-    fig, axes = plt.subplots(2, 1, figsize=(10, 9), sharex=True)
+    # The improvement panel is drawn only when the run has something to put in
+    # it: a difference needs an initial network to have been in the prompt.
+    improved = _paired_improvement(rows)
+    panels = 3 if improved else 2
+    height = BASE_HEIGHT + (PANEL_HEIGHT if improved else 0.0)
+    fig, axes = plt.subplots(panels, 1, figsize=(FIG_WIDTH, height),
+                             sharex=True)
+    # Figure fractions shrink as the figure grows; the caption band should not.
+    band = BASE_HEIGHT / height
+    bottom_ax = axes[-1]
 
     # Which model and which fine-tuning settings produced these numbers, and on
     # which dataset. Without them the curves cannot be compared between runs.
     head, tail, params = _run_caption(_run_config(base_dir) if base_dir else {}, rows)
-    y = 0.995
+    y = 1.0 - 0.005 * band          # scaled with the rest of the band
     if head:
         # Drawn as figure text rather than through suptitle: tight_layout
         # reserves a band of its own for a suptitle, which reappeared as a gap
@@ -572,25 +1419,29 @@ def plot_epoch_stats(rows, out_path, base_dir=None):
         # could close.
         fig.text(0.5, y, head, ha="center", va="top", fontsize=11,
                  fontweight="bold")
-        y -= 0.026
+        y -= 0.026 * band
     if tail:
-        fig.text(0.5, y, tail, ha="center", va="top", fontsize=8.8,
-                 color="#44474b", style="italic")
-        y -= 0.0275
+        # The band below keeps its height whatever size this lands at, so a
+        # long line costs point size and never a second row.
+        fig.text(0.5, y, tail, ha="center", va="top", style="italic",
+                 fontsize=_fit_fontsize(fig, tail, style="italic"),
+                 color="#44474b")
+        y -= 0.0275 * band
     if params:
         fig.text(0.5, y, "\n".join(params), ha="center", va="top",
-                 fontsize=7.0, family="monospace", color="#333333", linespacing=1.5)
-        y -= 0.013 * len(params)
-    header_bottom = y - HEADER_GAP
+                 fontsize=PARAM_FONTSIZE, family=PARAM_FONTFAMILY,
+                 color=PARAM_COLOR, linespacing=1.5)
+        y -= 0.013 * band * len(params)
+    header_bottom = y - HEADER_GAP * band
 
     # 1 -- percentage of correctly generated models, Wilson 95%
     pct = [100.0 * (r.get("valid_rate") or 0.0) for r in rows]
     lo = [100.0 * (r.get("valid_rate_ci_low") or 0.0) for r in rows]
     hi = [100.0 * (r.get("valid_rate_ci_high") or 0.0) for r in rows]
-    axes[0].plot(ep, pct, marker="o", color="#1f77b4", label="valid models", zorder=5)
+    axes[0].plot(ep, pct, marker="o", color=RATE, label="valid models", zorder=5)
     # Same fill weight as the accuracy bands below, so an interval reads the
     # same way on both panels.
-    _draw_band(axes[0], ep, lo, hi, "#1f77b4", "#1f77b4", CI_ALPHA, "Wilson 95% CI")
+    _draw_band(axes[0], ep, lo, hi, RATE, RATE, CI_ALPHA, "Wilson 95% CI")
     for x, r in zip(ep, rows):
         axes[0].annotate(f"{r.get('models_valid', 0)}/{r.get('models_generated', 0)}",
                          (x, 100.0 * (r.get("valid_rate") or 0.0)),
@@ -601,21 +1452,10 @@ def plot_epoch_stats(rows, out_path, base_dir=None):
     # the accuracy panel below: at 4/16 the interval runs 10-49% and swamps the
     # movement in the rate itself. Headroom leaves room for the n/N labels.
     axes[0].set_ylim(*_value_limits(pct, 0.0, 100.0))
-    axes[0].set_title("Valid generation rate per epoch")
-    axes[0].legend(loc="best", fontsize=8, framealpha=0.75, fancybox=False)
+    axes[0].set_title("Valid generation rate per cycle")
+    _draw_legend(axes[0], loc="best")
     axes[0].grid(alpha=0.3)
 
-    # Grey means "the original networks, before the LLM changed them" on every
-    # panel; green means the networks the LLM produced. Both are measurements
-    # of the same kind, so both are drawn solid and filled -- only the colour
-    # separates them.
-    GENERATED, ORIGINAL = "#2ca02c", "#7f7f7f"
-    # The best generated network is the headline number, so it gets its own
-    # colour rather than sharing green with the mean. A mid red sits ~ΔE 4 from
-    # this green under deuteranopia -- the classic red/green confusion -- so the
-    # red is taken dark enough to clear the threshold: #9d0208 separates at
-    # ΔE 10.5, leaving grey-vs-green as the worst pair on the panel.
-    BEST = "#9d0208"
 
     def _pick(*keys):
         """Rows where the first key is present, as parallel tuples."""
@@ -685,6 +1525,13 @@ def plot_epoch_stats(rows, out_path, base_dir=None):
                   r.get("accuracy_max"), r.get("baseline_accuracy_max"))
     ])
 
+    def _running_max(values):
+        out, best = [], float("-inf")
+        for value in values:
+            best = max(best, value)
+            out.append(best)
+        return out
+
     picked = _pick("baseline_accuracy_max")
     if picked is not None:
         xs, ys = picked
@@ -692,6 +1539,15 @@ def plot_epoch_stats(rows, out_path, base_dir=None):
                      linestyle="--", linewidth=1.1,
                      color=ORIGINAL, alpha=0.9, zorder=BEST_MARKER[0][1],
                      label="original best")
+        # The best network the run was ever given to work from, carried
+        # forward. Each cycle draws different seeds, so the per-cycle original
+        # best moves around and a generated network clearing the one grey
+        # square beside it has not necessarily cleared the best the run has
+        # seen. This line is the mark to beat, and the red line of the same
+        # style above or below it answers the question the run is asking.
+        axes[1].plot(xs, _running_max(ys), linestyle=":", linewidth=1.4,
+                     color=ORIGINAL, alpha=0.95, zorder=RUNNING_ZORDER,
+                     label="original best so far")
     picked = _pick("accuracy_max")
     if picked is not None:
         xs, ys = picked
@@ -699,52 +1555,159 @@ def plot_epoch_stats(rows, out_path, base_dir=None):
                      linestyle="--", linewidth=1.3,
                      color=BEST, alpha=0.95, zorder=BEST_MARKER[1][1],
                      label="generated best")
-        running, best = [], float("-inf")
-        for y in ys:
-            best = max(best, y)
-            running.append(best)
-        axes[1].plot(xs, running, linestyle=":", linewidth=1.2, color=BEST,
-                     alpha=0.6, zorder=4, label="generated best so far")
+        axes[1].plot(xs, _running_max(ys), linestyle=":", linewidth=1.4,
+                     color=BEST, alpha=0.8, zorder=RUNNING_ZORDER,
+                     label="generated best so far")
 
-        # The best network of the whole run: the one number a reader looks for.
-        # Placed against the settled limits so it stays on the panel wherever
-        # the peak falls -- below the marker when the peak is near the top,
-        # pushed inward at the first and last epoch where a centred label would
-        # cross a spine.
-        peak = max(range(len(ys)), key=lambda i: ys[i])
-        span = max(accuracy_hi - accuracy_lo, 1e-9)
-        near_top = (ys[peak] - accuracy_lo) / span > 0.82
-        if peak == len(xs) - 1:
-            dx, ha = -9, "right"
-        elif peak == 0:
-            dx, ha = 9, "left"
-        else:
-            dx, ha = 0, "center"
-        dy, va = (-10, "top") if near_top else (9, "bottom")
-        axes[1].annotate(
-            f"best {ys[peak]:.4f}", (xs[peak], ys[peak]),
-            textcoords="offset points", xytext=(dx, dy), ha=ha, va=va,
-            fontsize=8, color=BEST, fontweight="bold", zorder=7,
-            annotation_clip=False)
+        # The two headline numbers: the best network the run produced, and the
+        # best it was given to start from. The red one alone said how good the
+        # run got without saying what it had to beat, which is the comparison
+        # the panel exists for.
+        _annotate_peak(axes[1], xs, ys, BEST, accuracy_lo, accuracy_hi,
+                       other=_pick("baseline_accuracy_max"))
+        base_peak = _pick("baseline_accuracy_max")
+        if base_peak is not None:
+            _annotate_peak(axes[1], base_peak[0], base_peak[1], ORIGINAL,
+                           accuracy_lo, accuracy_hi, other=picked)
 
     axes[1].set_ylabel("accuracy")
-    axes[1].set_xlabel("epoch")
+    bottom_ax.set_xlabel(AXIS_LABEL)
     axes[1].set_ylim(accuracy_lo, accuracy_hi)
-    axes[1].set_title("Accuracy per epoch: mean with 95% CI, and best model "
+    axes[1].set_title("Accuracy per cycle: mean with 95% CI, and best model "
                       "(generated vs. original networks)")
-    if axes[1].get_legend_handles_labels()[0]:   # nothing to label on an all-failed epoch
-        axes[1].legend(loc="best", fontsize=8, framealpha=0.75, ncol=2, fancybox=False)
+    _draw_legend(axes[1], loc="best", ncol=2)   # None on an all-failed cycle
     axes[1].grid(alpha=0.3)
 
+    spans = _cycle_durations(_run_config(base_dir) if base_dir else {}, rows)
+    # 3 -- what the LLM actually changed, when the prompt carried an initial
+    # network to change. Panel 2 shows two curves and leaves the reader to
+    # subtract them by eye, which is exactly the comparison the run is for and
+    # the one a confidence interval is needed for: the curves overlap almost
+    # everywhere, and whether the gap is real cannot be read off two bands.
+    #
+    # Colour and style are panel 2's, so the two are read the same way: green
+    # and a round marker for the mean, the dark red of "generated best" and a
+    # dashed square for the maxima, grey for the original networks -- here the
+    # zero line, which is where the original cohort sits by construction.
+    if improved:
+        delta_ax = axes[2]
+        # Zero is where the original networks sit by construction, so the line
+        # is drawn as a reference and left out of the legend: naming it would
+        # spend a legend row restating what the axis already says.
+        delta_ax.axhline(0.0, color=ORIGINAL, linewidth=1.2, alpha=0.8,
+                         zorder=3)
+
+        picked = _pick("mean_improvement", "improvement_ci_low",
+                       "improvement_ci_high")
+        deltas = []
+        if picked is not None:
+            xs, ms, ls, hs = picked
+            # Same convention as panel 2: a cycle with one paired model has no
+            # estimable interval, and spans the feasible range rather than
+            # drawing a zero-width band that reads as certainty.
+            lo = [-1.0 if l is None else l for l in ls]
+            hi = [1.0 if h is None else h for h in hs]
+            _draw_band(delta_ax, xs, lo, hi, GENERATED, GENERATED, CI_ALPHA,
+                       "paired mean \u0394 95% CI")
+            size, z = MEAN_MARKER[1]
+            delta_ax.plot(xs, ms, marker="o", markersize=size, **MARKER_EDGE,
+                          linestyle="-", linewidth=1.6, color=GENERATED,
+                          label="paired mean \u0394", zorder=z)
+            deltas.extend(ms)
+
+        # The same comparison with the dependence on sample size taken out.
+        # A cycle that produced twelve valid models has a higher best than one
+        # that produced six for no reason but the extra draws, and the valid
+        # count climbs through a run, so the raw maxima below drift upward on
+        # their own. Reducing both cohorts to the expected best of a FIXED k
+        # removes that: what is left is what the best of k attempts gained.
+        k = _common_k(rows)
+        best_k = [(r["epoch"], _pairs(r)) for r in rows]
+        best_k = [(x, p, _best_of_k_from_pairs(p, k)) for x, p in best_k]
+        best_k = [(x, p, v) for x, p, v in best_k if v is not None]
+        if best_k and k:
+            xs = [x for x, _, _ in best_k]
+            ys = [v for _, _, v in best_k]
+            # Unlike the observed maximum beside it, this one can carry an
+            # interval: it is an average over the order statistics, which the
+            # bootstrap estimates consistently.
+            bounds = [_best_of_k_ci(p, k) for _, p, _ in best_k]
+            if all(lo is not None for lo, _ in bounds):
+                _draw_band(delta_ax, xs, [lo for lo, _ in bounds],
+                           [hi for _, hi in bounds], BEST, BEST, CI_ALPHA,
+                           f"best-of-{k} \u0394 95% CI")
+                deltas.extend(lo for lo, _ in bounds)
+                deltas.extend(hi for _, hi in bounds)
+            delta_ax.plot(xs, ys, marker="D", markersize=BEST_MARKER[0][0],
+                          **MARKER_EDGE, linestyle="-.", linewidth=1.3,
+                          color=BEST, alpha=0.95, zorder=BEST_MARKER[0][1],
+                          label=f"best-of-{k} \u0394")
+            deltas.extend(ys)
+
+            # The same figure over everything the run has produced so far.
+            # One cycle's tail rests on about ten models; this one rests on
+            # the run, and is the estimate panel 2's "best so far" implies.
+            pooled = [(r["epoch"], _best_of_k_from_pairs(p, k))
+                      for r, p in zip(rows, _cumulative_pairs(rows))]
+            pooled = [(x, v) for x, v in pooled if v is not None]
+            if len(pooled) > 1:
+                px, py = zip(*pooled)
+                delta_ax.plot(px, py, linestyle=":", linewidth=1.2,
+                              color=BEST, alpha=0.6, zorder=4,
+                              label=f"best-of-{k} \u0394 pooled so far")
+                deltas.extend(py)
+
+        # The difference of the two best networks as observed. It is NOT
+        # paired -- the best generated network and the best original one are
+        # generally not the same lineage -- so it carries no interval: there
+        # is no sample of differences here to take one over, only a single
+        # pair of maxima, and it is the quantity the best-of-k above corrects.
+        best_delta = [(r["epoch"], r["accuracy_max"] - r["baseline_accuracy_max"])
+                      for r in rows
+                      if r.get("accuracy_max") is not None
+                      and r.get("baseline_accuracy_max") is not None]
+        if best_delta:
+            xs, ys = zip(*best_delta)
+            size, z = BEST_MARKER[1]
+            delta_ax.plot(xs, ys, marker="s", markersize=size, **MARKER_EDGE,
+                          linestyle="--", linewidth=1.3, color=BEST,
+                          alpha=0.95, zorder=z, label="best \u0394 (observed)")
+            deltas.extend(ys)
+
+        # Framed on the differences themselves, like the panels above, and
+        # always including zero: the whole question is which side of it the
+        # curves fall on, and a panel cropped above zero answers it silently.
+        delta_lo, delta_hi = _value_limits(list(deltas) + [0.0], -1.0, 1.0)
+        delta_ax.set_ylim(delta_lo, delta_hi)
+        delta_ax.set_ylabel("\u0394 accuracy")
+        delta_ax.set_title("\u0394 accuracy per cycle (generated minus original): "
+                           "paired mean with 95% CI, and \u0394 of the best")
+        _draw_legend(delta_ax, loc="best", ncol=2)
+        delta_ax.grid(alpha=0.3)
+
     if ep:
-        axes[1].set_xticks(sorted(set(ep)))
+        bottom_ax.set_xticks(sorted(set(ep)))
+        if any(_fmt_span(s) for s in spans):
+            _reserve_cycle_spans(bottom_ax)
         if len(set(ep)) == 1:
-            # A single epoch leaves matplotlib to invent an x range; fix it so
+            # A single cycle leaves matplotlib to invent an x range; fix it so
             # the whiskers drawn by _draw_band sit at a sensible width.
             only = ep[0]
-            axes[1].set_xlim(only - 0.5, only + 0.5)
+            bottom_ax.set_xlim(only - 0.5, only + 0.5)
     _draw_brand(fig)
-    fig.tight_layout(rect=(0, 0.022, 1, max(0.70, header_bottom)), pad=0.6)
+    _draw_runtime(fig, _fmt_duration(_run_duration(
+        _run_config(base_dir) if base_dir else {}, rows)))
+    note = _wrap_note(fig, _figure_note(
+        bool(improved), _common_k(rows) if improved else None))
+    # The note is given a strip of its own at the foot of the figure, so it
+    # sits under the panels rather than taking room from the bottom one.
+    foot = 0.022 + _note_height_in(note, fig) / height
+    fig.tight_layout(rect=(0, foot, 1, max(0.70, header_bottom)), pad=0.6)
+    _draw_note(fig, note)
+    if ep:
+        # After the layout: these are placed against the rendered tick labels,
+        # into the room reserved for them above.
+        _draw_cycle_spans(bottom_ax, ep, spans)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150)
@@ -958,6 +1921,20 @@ def update_epoch_report(models_dir, epoch, base_dir):
         + (f" | datasets {', '.join(stats.get('datasets') or [])}"
            if stats.get("datasets") else "")
     )
+
+    cycle_max = stats.get("cycle_max")
+    ceiling = stats.get("corpus_ceiling")
+    best_ever = max((r.get("cycle_max") for r in rows
+                     if r.get("cycle_max") is not None), default=None)
+    print(
+        f"[EPOCH STATS] epoch {epoch}: cycle_max {fmt(cycle_max)} | "
+        f"best_ever {fmt(best_ever)} | "
+        f"above corpus ceiling {fmt(ceiling)}: {stats.get('n_above_ceiling')}"
+    )
+    losses = stats.get("failures") or {}
+    if any(losses.values()):
+        print("[EPOCH STATS] epoch %d losses: %s" % (
+            epoch, ", ".join(f"{k}={v}" for k, v in losses.items() if v)))
 
     seeds = stats.get("baseline_models_with_dataset") or []
     if seeds:

@@ -1,10 +1,11 @@
-# ab/gpt/util/Chatbot.py
+# ab/gpt/util/llm/Chatbot.py
 
 import os
 import re
 
-from transformers import PreTrainedTokenizer, PreTrainedModel, pipeline
+from transformers import PreTrainedModel, pipeline
 from ab.gpt.util.llm.GenerationDType import align_generation_head_dtype, infer_generation_head_dtype
+from ab.gpt.util.llm.LLMUtil import drop_vision_tower
 from ab.gpt.util.Util import extract_code, extract_hyperparam, extract_transform, extract_all_to_train
 from ab.gpt.util.prompt.Prompt import DEFAULT_CHAT_TEMPLATE
 import torch
@@ -20,6 +21,18 @@ example_prompt = (
         "Write PyTorch code for an efficient classification model that includes self-attention blocks."
         + extra_instructions
 )
+
+
+def _unwrap_tokenizer(tokenizer_or_processor):
+    """Return the real tokenizer behind a multimodal processor.
+
+    Thin wrapper over the shared implementation in LLMUtil: this file,
+    VLLMSleep and Prompt each grew their own copy, and three copies of one
+    rule is how they drift apart. The import is local so that nothing in the
+    module import order depends on it.
+    """
+    from ab.gpt.util.llm.LLMUtil import unwrap_tokenizer
+    return unwrap_tokenizer(tokenizer_or_processor)
 
 
 def _extract_generated_content(item):
@@ -94,11 +107,16 @@ def _context_limit(model, tokenizer, fallback: int = 4096) -> int:
     b (7462) at non-singleton dimension 3", and every length guard that trusted
     the config number waved the prompt through. Take the minimum of everything
     that claims to be a limit.
+
+    VL checkpoints (Qwen3.8-27B) nest the language-model settings under
+    config.text_config and may expose nothing useful at the top level, so that
+    sub-config is inspected too.
     """
     candidates = []
     cfg = getattr(model, "config", None)
+    text_cfg = getattr(cfg, "text_config", None) if cfg is not None else None
     generation_cfg = getattr(model, "generation_config", None)
-    for obj in (model, cfg, generation_cfg):
+    for obj in (model, cfg, text_cfg, generation_cfg):
         if obj is None:
             continue
         for attr in ("max_seq_length", "max_position_embeddings", "n_positions", "seq_length"):
@@ -123,11 +141,29 @@ def _output_budget(ctx: int, in_len: int, max_new_tokens) -> "int | None":
     return min(want, room)
 
 
-def _effective_vocab_size(tokenizer) -> int:
-    try:
-        return max(int(tokenizer.vocab_size), len(tokenizer))
-    except (AttributeError, TypeError, ValueError, OverflowError):
-        return len(tokenizer)
+def _effective_vocab_size(tokenizer) -> "int | None":
+    """Largest id the embedding table is known to accept, or None if unknown.
+
+    Returns None instead of raising when neither .vocab_size nor __len__ nor
+    get_vocab() is available; callers then skip the clamp rather than crashing.
+    A processor is unwrapped first, so the old AttributeError/TypeError pair
+    ('Qwen3VLProcessor' has no attribute 'vocab_size' / has no len()) cannot
+    occur.
+    """
+    tok = _unwrap_tokenizer(tokenizer)
+    sizes = []
+    for getter in (
+            lambda: int(tok.vocab_size),
+            lambda: len(tok),
+            lambda: len(tok.get_vocab()),
+    ):
+        try:
+            n = getter()
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            continue
+        if isinstance(n, int) and n > 0:
+            sizes.append(n)
+    return max(sizes) if sizes else None
 
 
 def _strip_reasoning_output(text: str) -> str:
@@ -151,12 +187,19 @@ def _strip_reasoning_output(text: str) -> str:
 class ChatBot:
     MIN_PROMPT_TOKENS = 1024  # never starve the prompt below this
 
-    def __init__(self, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, keep_memory=False,
+    def __init__(self, model: PreTrainedModel, tokenizer, keep_memory=False,
                  temperature=1.0, top_k=50, top_p=0.9, system_prompt: str = None,
                  budget_tokens=None, suppress_thinking=False):
         self.show_additional_info = False
         self.model = model
-        self.tokenizer = tokenizer
+        # `tokenizer` may be a processor (Qwen3.8-27B and other VL checkpoints).
+        # Keep the original for any image-bearing path, but do all text work
+        # through the unwrapped tokenizer.
+        self.processor = tokenizer
+        self.tokenizer = _unwrap_tokenizer(tokenizer)
+        if self.tokenizer is not self.processor:
+            print(f"[ChatBot] {type(self.processor).__name__} detected; "
+                  f"using its inner {type(self.tokenizer).__name__} for all text operations.")
         self.__keep_memory = keep_memory
         self.temperature = temperature
         self.top_k = top_k
@@ -173,8 +216,23 @@ class ChatBot:
         # used for the training-data build so training and inference prompt formats match.
         # Tokenizers that already define chat_template (Qwen, DeepSeek, ...) are untouched.
         if not self.disable_chat_template and not getattr(self.tokenizer, "chat_template", None):
-            print("[ChatBot] Tokenizer has no chat_template; applying default User/Assistant fallback.")
-            self.tokenizer.chat_template = DEFAULT_CHAT_TEMPLATE
+            inherited = getattr(self.processor, "chat_template", None)
+            if inherited:
+                # VL processors often hold the template while the inner tokenizer
+                # does not. Reuse the real one rather than the generic fallback.
+                print("[ChatBot] Taking chat_template from the processor.")
+                self.tokenizer.chat_template = inherited
+            else:
+                print("[ChatBot] Tokenizer has no chat_template; applying default User/Assistant fallback.")
+                self.tokenizer.chat_template = DEFAULT_CHAT_TEMPLATE
+
+        # generate() errors out when pad_token_id is None, which is common on
+        # checkpoints that only define eos.
+        if getattr(self.tokenizer, "pad_token_id", None) is None:
+            eos = getattr(self.tokenizer, "eos_token", None)
+            if eos is not None:
+                self.tokenizer.pad_token = eos
+                print(f"[ChatBot] pad_token was unset; using eos_token ({eos!r}).")
 
         # Check if model is ONNX (wrapped or direct ORTModel)
         self.is_onnx = (
@@ -182,6 +240,12 @@ class ChatBot:
                 type(model).__name__ == 'ORTModelForCausalLM' or
                 'ORTModel' in type(model).__name__
         )
+
+        # Safety net: LLM.py already drops the ViT of VL checkpoints at load, but
+        # a ChatBot can also be handed a model loaded elsewhere. drop_vision_tower
+        # is idempotent, so a second call on an already-trimmed model is free.
+        if not self.is_onnx:
+            drop_vision_tower(self.model, log_prefix="[ChatBot]")
 
         if not self.is_onnx:
             generation_dtype = infer_generation_head_dtype(self.model)
@@ -244,9 +308,23 @@ class ChatBot:
         (class swap). Never blocks construction on failure."""
         try:
             tok = self.tokenizer
-            old = tok.vocab_size
-            cfg_vocab = getattr(getattr(self.model, 'config', None), 'vocab_size', 0) or 0
-            true_bound = max(len(tok), cfg_vocab)
+            old = getattr(tok, 'vocab_size', None)
+            if not isinstance(old, int):
+                print('[vocab_bound] tokenizer exposes no integer vocab_size; '
+                      'skipping (id clamping will use len()/get_vocab()).', flush=True)
+                return
+            cfg = getattr(self.model, 'config', None)
+            text_cfg = getattr(cfg, 'text_config', None)
+            cfg_vocab = 0
+            for obj in (cfg, text_cfg):
+                n = getattr(obj, 'vocab_size', 0) or 0
+                if isinstance(n, int):
+                    cfg_vocab = max(cfg_vocab, n)
+            try:
+                tok_len = len(tok)
+            except TypeError:
+                tok_len = 0
+            true_bound = max(tok_len, cfg_vocab)
             if true_bound <= old:
                 return
 
@@ -278,16 +356,34 @@ class ChatBot:
             print(f'[vocab_bound] WARNING: patch failed ({type(e).__name__}: {e}); '
                   f'run continues unchanged.', flush=True)
 
+    def _clamp_token_ids(self, inputs, label=''):
+        """Clamp out-of-range ids in place; no-op when the bound is unknown."""
+        if 'input_ids' not in inputs:
+            return
+        vocab_size = _effective_vocab_size(self.tokenizer)
+        if vocab_size is None:
+            return
+        input_ids = inputs['input_ids']
+        max_token_id = input_ids.max().item()
+        if max_token_id >= vocab_size:
+            print(f"[WARN] Invalid token IDs detected{label}: "
+                  f"max_id={max_token_id}, vocab_size={vocab_size}")
+            inputs['input_ids'] = torch.clamp(input_ids, max=vocab_size - 1)
+            print(f"[WARN] After clamping: max_id={inputs['input_ids'].max().item()}")
+
     def _eos_token_ids(self):
         """eos id(s) for generation, always including <|im_end|> when the tokenizer knows it."""
-        eos = self.tokenizer.eos_token_id
+        eos = getattr(self.tokenizer, 'eos_token_id', None)
         if eos is None:
             ids = []
         elif isinstance(eos, (list, tuple)):
             ids = list(eos)
         else:
             ids = [eos]
-        im_end = self.tokenizer.convert_tokens_to_ids('<|im_end|>')
+        try:
+            im_end = self.tokenizer.convert_tokens_to_ids('<|im_end|>')
+        except (AttributeError, TypeError):
+            im_end = None
         unk = getattr(self.tokenizer, 'unk_token_id', None)
         if im_end is not None and im_end != unk and im_end not in ids:
             ids.append(im_end)
@@ -301,6 +397,27 @@ class ChatBot:
         messages.append({"role": "user", "content": user_content})
         return messages
 
+    def _render_chat_template(self, messages) -> str:
+        """apply_chat_template, asking hybrid-thinking models for non-thinking mode.
+
+        Qwen3.8 is a hybrid thinking model: thinking is ON by default and the
+        supported way to turn it off is the template flag, not a pre-closed
+        <think> block. Qwen2.5 templates ignore the unknown variable, so the same
+        call is safe for both; the TypeError guards cover templates that reject
+        extra kwargs outright.
+        """
+        base = dict(tokenize=False, add_generation_prompt=True)
+        if self.suppress_thinking:
+            for extra in ({"enable_thinking": False},
+                          {"chat_template_kwargs": {"enable_thinking": False}}):
+                try:
+                    return self.tokenizer.apply_chat_template(messages, **base, **extra)
+                except TypeError:
+                    continue
+                except Exception:
+                    break
+        return self.tokenizer.apply_chat_template(messages, **base)
+
     def _apply_thinking_suppression(self, templated):
         """Close OlympicCoder-7B's auto-opened <think> block so the model skips
         chain-of-thought and writes code directly.
@@ -313,8 +430,13 @@ class ChatBot:
         paths are also used as *fallbacks*, so suppression could switch itself
         off part-way through an epoch. It is applied in one place now and all
         three paths call it.
+
+        Harmless when _render_chat_template already produced a closed block
+        (Qwen3.8 non-thinking mode): the endswith check simply does not fire.
         """
         if not self.suppress_thinking or not templated:
+            return templated
+        if templated.rstrip().endswith('</think>'):
             return templated
         if templated.rstrip().endswith('<think>'):
             return templated.rstrip() + '</think>'
@@ -327,11 +449,7 @@ class ChatBot:
     def _templated_from_messages(self, messages, fallback_text=None):
         """Render a messages list to a prompt string, suppression included."""
         if not self.disable_chat_template and hasattr(self.tokenizer, 'apply_chat_template'):
-            templated = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True
-            )
+            templated = self._render_chat_template(messages)
         elif self.system_prompt:
             body = fallback_text if fallback_text is not None else '\n'.join(
                 f"{m['role'].capitalize()}: {m['content']}" for m in messages)
@@ -356,7 +474,7 @@ class ChatBot:
         path cannot disagree about what fits.
         """
         ctx = _context_limit(self.model, self.tokenizer)
-        in_len = len(self.tokenizer(formatted_prompt, add_special_tokens=False)['input_ids'])
+        in_len = len(self.tokenizer(text=formatted_prompt, add_special_tokens=False)['input_ids'])
         new_tokens = _output_budget(ctx, in_len, max_new_tokens)
         if new_tokens is None:
             print(f"[gen] SKIPPED{label}: input_tokens={in_len} max_seq_length={ctx} "
@@ -402,6 +520,16 @@ class ChatBot:
                   f'asked to do.')
         return max_input_len
 
+    def _resolve_device(self):
+        if hasattr(self.model, 'device') and self.model.device is not None:
+            return self.model.device
+        if self.is_onnx:
+            return torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        try:
+            return next(self.model.parameters()).device
+        except StopIteration:
+            return torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
     def _direct_generate_batch(self, prompts, max_new_tokens=None, max_len=None):
         """Run true batched generation via model.generate and strip prompt prefixes by token length."""
         if hasattr(self.model, "eval"):
@@ -419,7 +547,7 @@ class ChatBot:
         else:
             max_input_len = ctx - token_budget
             lengths = [len(ids) for ids in self.tokenizer(
-                formatted_prompts, add_special_tokens=False)["input_ids"]]
+                text=formatted_prompts, add_special_tokens=False)["input_ids"]]
             kept = []
             for pos, in_len in enumerate(lengths):
                 if _output_budget(ctx, in_len, token_budget) is None:
@@ -439,7 +567,7 @@ class ChatBot:
         self.tokenizer.padding_side = "left"
         try:
             inputs = self.tokenizer(
-                [formatted_prompts[pos] for pos in kept],
+                text=[formatted_prompts[pos] for pos in kept],
                 return_tensors="pt",
                 padding=True,
                 add_special_tokens=False,  # chat template already includes BOS; prevents EOS being appended
@@ -448,25 +576,11 @@ class ChatBot:
         finally:
             self.tokenizer.padding_side = original_padding_side
 
-        if 'input_ids' in inputs:
-            input_ids = inputs['input_ids']
-            vocab_size = _effective_vocab_size(self.tokenizer)
-            max_token_id = input_ids.max().item()
-            if max_token_id >= vocab_size:
-                print(f"[WARN] Invalid token IDs detected in batch: max_id={max_token_id}, vocab_size={vocab_size}")
-                inputs['input_ids'] = torch.clamp(input_ids, max=vocab_size - 1)
+        self._clamp_token_ids(inputs, label=' in batch')
 
-        if hasattr(self.model, 'device') and self.model.device is not None:
-            device = self.model.device
-        elif self.is_onnx:
-            device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-        else:
-            try:
-                device = next(self.model.parameters()).device
-            except StopIteration:
-                device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        device = self._resolve_device()
 
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+        inputs = {k: v.to(device) for k, v in inputs.items() if isinstance(v, torch.Tensor)}
         # With left-padding, all sequences in the batch share the same padded input length.
         # The generated tokens start at index padded_input_length in each output row.
         padded_input_length = inputs['input_ids'].shape[1]
@@ -586,7 +700,7 @@ class ChatBot:
     def _format_messages(self, messages) -> str:
         """Prompt text exactly as _direct_generate builds it."""
         if not self.disable_chat_template and hasattr(self.tokenizer, 'apply_chat_template'):
-            return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            return self._render_chat_template(messages)
         formatted_prompt = "\n".join([f"{msg['role'].capitalize()}: {msg['content']}" for msg in messages])
         return f"{formatted_prompt}\nAssistant:"
 
@@ -615,11 +729,7 @@ class ChatBot:
         try:
             # Apply chat template to format messages
             if not self.disable_chat_template and hasattr(self.tokenizer, 'apply_chat_template'):
-                formatted_prompt = self.tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True
-                )
+                formatted_prompt = self._render_chat_template(messages)
             else:
                 # Fallback: concatenate messages
                 formatted_prompt = "\n".join([f"{msg['role'].capitalize()}: {msg['content']}" for msg in messages])
@@ -649,36 +759,18 @@ class ChatBot:
             # was never bound in this function and made every call to this
             # fallback die with NameError.
             inputs = self.tokenizer(
-                formatted_prompt,
+                text=formatted_prompt,
                 return_tensors="pt",
                 add_special_tokens=False,  # chat template already includes BOS; prevents EOS being appended
                 **tokenize_kwargs,
             )
 
             # -- FIX 1: Validate token IDs before GPU move --
-            if 'input_ids' in inputs:
-                input_ids = inputs['input_ids']
-                vocab_size = _effective_vocab_size(self.tokenizer)
-                max_token_id = input_ids.max().item()
+            self._clamp_token_ids(inputs)
 
-                if max_token_id >= vocab_size:
-                    print(f"[WARN] Invalid token IDs detected: max_id={max_token_id}, vocab_size={vocab_size}")
-                    print(f"[WARN] Clamping to valid range [0, {vocab_size - 1}]")
-                    input_ids = torch.clamp(input_ids, max=vocab_size - 1)
-                    inputs['input_ids'] = input_ids
-                    print(f"[WARN] After clamping: max_id={input_ids.max().item()}")
+            device = self._resolve_device()
 
-            if hasattr(self.model, 'device') and self.model.device is not None:
-                device = self.model.device
-            elif self.is_onnx:
-                device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-            else:
-                try:
-                    device = next(self.model.parameters()).device
-                except StopIteration:
-                    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
-            inputs = {k: v.to(device) for k, v in inputs.items()}
+            inputs = {k: v.to(device) for k, v in inputs.items() if isinstance(v, torch.Tensor)}
 
             # FIX: Store input length before generation
             input_length = inputs['input_ids'].shape[-1]  # Use shape[-1] for sequence length

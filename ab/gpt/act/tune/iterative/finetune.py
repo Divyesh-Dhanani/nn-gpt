@@ -45,6 +45,24 @@ from ab.gpt.util.Const import nngpt_dir, new_nn_file, DEFAULT_DATASET, DEFAULT_N
 logger = logging.getLogger(__name__)
 
 
+
+def _vllm_child_flags(cycle, environ):
+    """Generation-backend arguments for the per-cycle child, and an optional warning.
+
+    vLLM sees the previous cycle's adapter only when it is carried over unmerged (NNGPT_CARRY_ADAPTER=1).
+    Then the parent's --use_vllm / --no-use_vllm (ab.gpt.act.tune.Tune sets NNGPT_VLLM_SLEEP from it) is
+    forwarded, because the child's own default is on. Without carry-over the child command is unchanged.
+    """
+    on = {"1", "true", "yes", "on"}
+    use_vllm = environ.get("NNGPT_VLLM_SLEEP", "1").strip().lower() in on
+    carry = environ.get("NNGPT_CARRY_ADAPTER", "").strip().lower() in on
+    if carry:
+        return ["--use_vllm" if use_vllm else "--no-use_vllm"], None
+    if use_vllm and cycle > 1:
+        return [], ("[Pipeline] WARNING: vLLM generation without NNGPT_CARRY_ADAPTER=1: the previous cycle's "
+                    "adapter is merged into the in-memory model, which the vLLM engine does not see.")
+    return [], None
+
 class IterativeFinetuner:
     """Orchestrates the iterative fine-tuning pipeline."""
 
@@ -466,6 +484,11 @@ class IterativeFinetuner:
             cmd.extend(["--dataset", str(self.dataset)])
         if self.nn_prefixes:
             cmd.extend(["--nn_prefixes", ",".join(self.nn_prefixes)])
+
+        vllm_flags, vllm_warning = _vllm_child_flags(cycle, os.environ)
+        if vllm_warning:
+            print(vllm_warning, flush=True)
+        cmd.extend(vllm_flags)
 
         # Load previous cycle's checkpoint for continual learning (cycle 2+)
         if cycle > 1:
